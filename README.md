@@ -20,7 +20,7 @@ Application code interacts only with this library. Watermill, Redis Streams, and
 - *(Planned: Phase 2b)* At-least-once delivery with three-layer retry and poison-message protection
 - *(Planned: Phase 2b)* Dead Letter Queue with a defined wrapper contract
 - Correlation-ID propagation across service chains
-- OpenTelemetry tracing and Prometheus metrics out of the box
+- *(Planned: Phase 3)* OpenTelemetry tracing and Prometheus metrics
 - Structured logging via `slog`
 - A `testing/` package for unit-testing handlers without Redis
 
@@ -137,17 +137,19 @@ The library is **at-least-once**. Three consequences are application obligations
 
 ## Error handling
 
-> **Planned for Phase 2b — not yet implemented.**
+A handler that returns an error NACKs the message, leaving it pending in Redis Streams. The reclaim loop redelivers the message indefinitely — there is no delivery-attempt cap and no Dead Letter Queue in Phase 2a. An unhandleable message will retry forever.
 
-Handlers will classify failures by wrapping the returned error:
+> **Planned for Phase 2b** — Error classification API and delivery caps will allow handlers to mark failures as permanent (route to DLQ, then ACK) or transient (automatic retry). Unclassified errors will be treated as retryable.
+
+Error classification will work by wrapping the returned error:
 
 ```go
-return messaging.AsPermanent(err) // → Dead Letter Queue, then ACK
-return messaging.AsRetryable(err) // → retried (also the default for unclassified errors)
-return messaging.AsDiscard(err)   // → acknowledged without retry
+return messaging.AsPermanent(err) // → Dead Letter Queue, then ACK (Phase 2b)
+return messaging.AsRetryable(err) // → retried (Phase 2b)
+return messaging.AsDiscard(err)   // → acknowledged without retry (Phase 2b)
 ```
 
-Retries will run in three layers: in-process immediate retries, Redis Streams pending-and-reclaim redelivery, and a `MaxDeliveryAttempts` cap that routes poison messages to the DLQ regardless of classification.
+Until Phase 2b arrives, the safest pattern is for handlers to be idempotent and circuit-break on detected errors, logging them for human review.
 
 ## Dead Letter Queue
 
@@ -171,7 +173,9 @@ Redis auth/TLS, pool sizing, consumer concurrency, claim intervals, delivery cap
 
 ## Observability
 
-Publish and consume are traced with linked OpenTelemetry spans; correlation IDs propagate through the context automatically. Prometheus metrics cover published/received/processed/failed counts, retries, DLQ volume, and processing latency. Structured logs include event, topic, consumer, and error-category fields. Payloads are not logged by default.
+Consumers emit structured `slog` logs on validation errors and handler dispatch. Logged fields include `topic`, `event_id`, `event_type` (when a handler is not found), and `error`. Correlation IDs propagate through handler contexts via `context.Context`.
+
+> **Planned for Phase 3** — OpenTelemetry tracing with linked spans for publish and consume, and Prometheus metrics covering event counts (published/received/processed/failed), retries, and processing latency.
 
 ## Testing
 
