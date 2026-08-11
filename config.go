@@ -31,13 +31,40 @@ type RedisConfig struct {
 // MaxDeliveryAttempts is defaulted here but is not enforced until the
 // delivery-attempt cap lands in Phase 2b.
 type ConsumerConfig struct {
-	Group               string
-	ConsumerName        string
-	Concurrency         int
-	ClaimInterval       time.Duration
-	ClaimMinIdle        time.Duration
+	// Group is the Redis consumer group name. Required.
+	Group string
+
+	// ConsumerName identifies this instance within Group. Defaults to
+	// <hostname>-<random suffix>, which stays unique across replicas and
+	// restarts on one host.
+	ConsumerName string
+
+	// Concurrency bounds how many messages may be in flight at once *per
+	// subscribed topic*, not across the consumer as a whole: a consumer
+	// registered on three topics at Concurrency 3 can be running nine
+	// handlers. The bound is per topic because each topic has its own read
+	// loop, and a shared bound would let an idle topic's blocking read
+	// throttle a busy one. Defaults to 1, at which per-topic ordering is
+	// preserved.
+	Concurrency int
+
+	// ClaimInterval is how often the reclaim sweep runs. Defaults to 30s.
+	ClaimInterval time.Duration
+
+	// ClaimMinIdle is how long an entry must sit unacknowledged before
+	// another consumer may reclaim it. It must be >= ClaimInterval, and it
+	// must also exceed the longest a handler is expected to run: at
+	// Concurrency > 1 a handler still running after ClaimMinIdle has its
+	// own message reclaimed and processed concurrently by this same
+	// process. Defaults to 60s.
+	ClaimMinIdle time.Duration
+
+	// MaxDeliveryAttempts is defaulted to 5 but is inert until Phase 2b.
 	MaxDeliveryAttempts int
-	ShutdownTimeout     time.Duration
+
+	// ShutdownTimeout bounds the drain of in-flight handlers after the Run
+	// context is cancelled. Defaults to 30s.
+	ShutdownTimeout time.Duration
 }
 
 // RetryConfig configures the in-process immediate-retry layer (PRD §13

@@ -3,6 +3,7 @@ package watermill
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -380,5 +381,114 @@ func TestSubscriber_ClaimLoopSkippedWithoutClaimInterval(t *testing.T) {
 	case msg := <-out:
 		t.Fatalf("unexpected reclaim with ClaimInterval unset: %q", msg.UUID)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// multiStreamReader serves a different behaviour per stream so one
+// subscription's read latency can be observed against another's throughput.
+type multiStreamReader struct {
+	mu sync.Mutex
+	// busyStream has an unlimited supply of entries, served immediately.
+	busyStream string
+	busyNext   int
+	// Every other stream never has an entry and always burns the full
+	// blocking read, exactly as an empty XREADGROUP does.
+}
+
+func (m *multiStreamReader) EnsureGroup(context.Context, string) error { return nil }
+
+func (m *multiStreamReader) ReadNew(ctx context.Context, stream string, _ int64, block time.Duration) ([]internalredis.Entry, error) {
+	if stream == m.busyStream {
+		m.mu.Lock()
+		m.busyNext++
+		id := strconv.Itoa(m.busyNext) + "-0"
+		m.mu.Unlock()
+		return []internalredis.Entry{entry(id, "busy-"+id, "{}")}, nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(block):
+		return nil, nil
+	}
+}
+
+func (m *multiStreamReader) PendingOverIdle(context.Context, string, time.Duration, int64) ([]internalredis.PendingEntry, error) {
+	return nil, nil
+}
+
+func (m *multiStreamReader) Claim(context.Context, string, time.Duration, []string) ([]internalredis.Entry, error) {
+	return nil, nil
+}
+
+func (m *multiStreamReader) Ack(context.Context, string, ...string) error { return nil }
+
+// TestSubscriber_TopicsDoNotStarveEachOther pins the concurrency bound to a
+// single subscription. Watermill calls Subscribe once per handler, so a
+// Subscriber-wide semaphore would be shared by every topic's read loop — and
+// because a slot is deliberately held across the whole blocking read, an
+// idle topic's empty XREADGROUP would hold the only slot for BlockTime at a
+// time while a busy topic's backlog waited on it.
+//
+// With a per-subscription semaphore the busy stream is limited only by how
+// fast its messages are acked; with a shared one it is limited to roughly
+// one message per BlockTime.
+func TestSubscriber_TopicsDoNotStarveEachOther(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const (
+		blockTime = 500 * time.Millisecond
+		want      = 20
+		budget    = 2 * time.Second
+	)
+
+	reader := &multiStreamReader{busyStream: "busy"}
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader: reader,
+		// The documented default, and the value at which the bug bites
+		// hardest.
+		Concurrency: 1,
+		BlockTime:   blockTime,
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	// Subscribed in the order that hurts: the idle topic takes a slot first.
+	idleOut, err := sub.Subscribe(ctx, "idle")
+	if err != nil {
+		t.Fatalf("Subscribe(idle): %v", err)
+	}
+	busyOut, err := sub.Subscribe(ctx, "busy")
+	if err != nil {
+		t.Fatalf("Subscribe(busy): %v", err)
+	}
+
+	// Drain the idle channel so its subscription behaves normally; it never
+	// actually produces anything.
+	go func() {
+		for msg := range idleOut {
+			msg.Ack()
+		}
+	}()
+
+	deadline := time.After(budget)
+	got := 0
+	for got < want {
+		select {
+		case msg, open := <-busyOut:
+			if !open {
+				t.Fatalf("busy channel closed after %d of %d messages", got, want)
+			}
+			msg.Ack()
+			got++
+		case <-deadline:
+			t.Fatalf("busy stream delivered %d of %d messages in %v; an idle "+
+				"co-subscribed topic must not throttle it (a shared semaphore "+
+				"caps it at about one message per %v)", got, want, budget, blockTime)
+		}
 	}
 }

@@ -33,6 +33,10 @@ const (
 	// readErrorBackoff throttles a failing read loop so a broken connection
 	// does not spin.
 	readErrorBackoff = 500 * time.Millisecond
+	// ackTimeout bounds the XACK issued after a message is acked. It is
+	// deliberately independent of the subscription context so a message
+	// completing during a drain is still acknowledged.
+	ackTimeout = 5 * time.Second
 )
 
 // StreamReader is the Redis Streams surface the Subscriber needs. It is
@@ -48,6 +52,9 @@ type StreamReader interface {
 // SubscriberOptions configures a Subscriber. BlockTime is an internal knob
 // (defaulted to 1s) so tests can shorten the blocking read; it deliberately
 // has no equivalent in the public messaging.Config.
+//
+// Concurrency bounds in-flight messages per subscribed stream, not across
+// the Subscriber as a whole — see Subscribe.
 type SubscriberOptions struct {
 	Reader        StreamReader
 	Concurrency   int
@@ -62,15 +69,30 @@ type SubscriberOptions struct {
 // behaviour cannot exceed the configured concurrency.
 type Subscriber struct {
 	reader        StreamReader
+	concurrency   int
 	claimInterval time.Duration
 	claimMinIdle  time.Duration
 	blockTime     time.Duration
 	logger        wm.LoggerAdapter
 
-	sem       chan struct{}
 	closing   chan struct{}
 	wg        sync.WaitGroup
 	closeOnce sync.Once
+}
+
+// subscription is the state of one Subscribe call: one stream, one output
+// channel, and its own concurrency semaphore.
+//
+// The semaphore is per-subscription rather than per-Subscriber because
+// watermill calls Subscribe once per handler. A Subscriber-wide semaphore
+// let one topic's read loop hold a slot for the whole blocking read while
+// another topic's backlog waited on it: at the default Concurrency of 1, an
+// idle topic could throttle a busy one to roughly one message per BlockTime.
+type subscription struct {
+	sub    *Subscriber
+	stream string
+	sem    chan struct{}
+	out    chan *message.Message
 }
 
 // NewSubscriber builds a Subscriber. Concurrency below 1 is treated as 1.
@@ -90,11 +112,11 @@ func NewSubscriber(opts SubscriberOptions) (*Subscriber, error) {
 
 	return &Subscriber{
 		reader:        opts.Reader,
+		concurrency:   opts.Concurrency,
 		claimInterval: opts.ClaimInterval,
 		claimMinIdle:  opts.ClaimMinIdle,
 		blockTime:     opts.BlockTime,
 		logger:        opts.Logger,
-		sem:           make(chan struct{}, opts.Concurrency),
 		closing:       make(chan struct{}),
 	}, nil
 }
@@ -105,6 +127,10 @@ func NewSubscriber(opts SubscriberOptions) (*Subscriber, error) {
 // message's ack-wait goroutine and its concurrency slot. Callers must always
 // call Close, even after cancelling ctx.
 //
+// Each call gets its own semaphore of capacity Concurrency, so the bound is
+// per subscribed stream. Subscribing to several streams therefore allows
+// Concurrency in-flight messages on each, and no stream can starve another.
+//
 // The ack-wait deliberately does not observe ctx: a message that completes
 // during a graceful drain (ctx already cancelled, Close not yet called) must
 // still be acked rather than left to be redelivered.
@@ -113,45 +139,52 @@ func (s *Subscriber) Subscribe(ctx context.Context, stream string) (<-chan *mess
 		return nil, fmt.Errorf("ensuring consumer group on %q: %w", stream, err)
 	}
 
-	out := make(chan *message.Message)
+	sub := &subscription{
+		sub:    s,
+		stream: stream,
+		sem:    make(chan struct{}, s.concurrency),
+		out:    make(chan *message.Message),
+	}
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		defer close(out)
+		defer close(sub.out)
 
 		var loops sync.WaitGroup
 
 		loops.Add(1)
 		go func() {
 			defer loops.Done()
-			s.readLoop(ctx, stream, out)
+			sub.readLoop(ctx)
 		}()
 
 		if s.claimInterval > 0 {
 			loops.Add(1)
 			go func() {
 				defer loops.Done()
-				s.claimLoop(ctx, stream, out)
+				sub.claimLoop(ctx)
 			}()
 		}
 
 		loops.Wait()
 	}()
 
-	return out, nil
+	return sub.out, nil
 }
 
 // readLoop fetches never-delivered entries one slot at a time.
-func (s *Subscriber) readLoop(ctx context.Context, stream string, out chan<- *message.Message) {
+func (sc *subscription) readLoop(ctx context.Context) {
+	s := sc.sub
+
 	for {
-		if !s.acquire(ctx) {
+		if !sc.acquire(ctx) {
 			return
 		}
 
-		entries, err := s.reader.ReadNew(ctx, stream, 1, s.blockTime)
+		entries, err := s.reader.ReadNew(ctx, sc.stream, 1, s.blockTime)
 		if err != nil || len(entries) == 0 {
-			s.release()
+			sc.release()
 			if s.stopped(ctx) {
 				return
 			}
@@ -163,7 +196,7 @@ func (s *Subscriber) readLoop(ctx context.Context, stream string, out chan<- *me
 
 		// One slot was acquired, so exactly one entry is emitted; any
 		// surplus would have nowhere to run.
-		if !s.emit(ctx, stream, out, entries[0], 1) {
+		if !sc.emit(ctx, entries[0], 1) {
 			return
 		}
 	}
@@ -174,7 +207,9 @@ func (s *Subscriber) readLoop(ctx context.Context, stream string, out chan<- *me
 // nacked messages are redelivered and how messages survive a crashed
 // consumer. Reclaimed messages arrive out of order relative to the live
 // stream, which is inherent to reclaim.
-func (s *Subscriber) claimLoop(ctx context.Context, stream string, out chan<- *message.Message) {
+func (sc *subscription) claimLoop(ctx context.Context) {
+	s := sc.sub
+
 	ticker := time.NewTicker(s.claimInterval)
 	defer ticker.Stop()
 
@@ -187,21 +222,21 @@ func (s *Subscriber) claimLoop(ctx context.Context, stream string, out chan<- *m
 		case <-ticker.C:
 		}
 
-		pending, err := s.reader.PendingOverIdle(ctx, stream, s.claimMinIdle, claimBatchSize)
+		pending, err := s.reader.PendingOverIdle(ctx, sc.stream, s.claimMinIdle, claimBatchSize)
 		if err != nil {
 			s.pause(ctx, readErrorBackoff)
 			continue
 		}
 
 		for _, p := range pending {
-			if !s.acquire(ctx) {
+			if !sc.acquire(ctx) {
 				return
 			}
 
-			entries, err := s.reader.Claim(ctx, stream, s.claimMinIdle, []string{p.ID})
+			entries, err := s.reader.Claim(ctx, sc.stream, s.claimMinIdle, []string{p.ID})
 			if err != nil || len(entries) == 0 {
 				// Lost the race to another instance, or the entry is gone.
-				s.release()
+				sc.release()
 				if s.stopped(ctx) {
 					return
 				}
@@ -210,22 +245,24 @@ func (s *Subscriber) claimLoop(ctx context.Context, stream string, out chan<- *m
 
 			// XPENDING reports deliveries that already happened; the XCLAIM
 			// just issued is the next one.
-			if !s.emit(ctx, stream, out, entries[0], p.RetryCount+1) {
+			if !sc.emit(ctx, entries[0], p.RetryCount+1) {
 				return
 			}
 		}
 	}
 }
 
-// emit decodes an entry, hands it to out, and arranges for its ack or nack
-// to be honoured. The caller must already hold a semaphore slot; emit takes
-// responsibility for releasing it.
-func (s *Subscriber) emit(ctx context.Context, stream string, out chan<- *message.Message, e internalredis.Entry, attempt int64) bool {
+// emit decodes an entry, hands it to the output channel, and arranges for
+// its ack or nack to be honoured. The caller must already hold a semaphore
+// slot; emit takes responsibility for releasing it.
+func (sc *subscription) emit(ctx context.Context, e internalredis.Entry, attempt int64) bool {
+	s := sc.sub
+
 	msg, err := decodeEntry(e, attempt)
 	if err != nil {
 		// An entry we cannot even decode is left pending rather than
 		// dropped; Phase 2b routes it to the DLQ.
-		s.release()
+		sc.release()
 		return !s.stopped(ctx)
 	}
 
@@ -237,37 +274,26 @@ func (s *Subscriber) emit(ctx context.Context, stream string, out chan<- *messag
 	msg.SetContext(msgCtx)
 
 	select {
-	case out <- msg:
+	case sc.out <- msg:
 	case <-s.closing:
 		cancelMsgCtx()
-		s.release()
+		sc.release()
 		return false
 	case <-ctx.Done():
 		cancelMsgCtx()
-		s.release()
+		sc.release()
 		return false
 	}
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		defer s.release()
+		defer sc.release()
 		defer cancelMsgCtx()
 
 		select {
 		case <-msg.Acked():
-			// Ack with a context detached from the subscription (not
-			// msgCtx) so a shutdown in progress still records completed
-			// work, and so the cancelMsgCtx() above cannot race-abort the
-			// very XACK it is meant to follow.
-			ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			defer cancel()
-			if err := s.reader.Ack(ackCtx, stream, e.ID); err != nil {
-				s.logger.Error("failed to ack stream entry", err, wm.LogFields{
-					"stream":   stream,
-					"entry_id": e.ID,
-				})
-			}
+			sc.ack(ctx, e.ID)
 		case <-msg.Nacked():
 			// Leave the entry pending; the claim loop redelivers it.
 		case <-s.closing:
@@ -275,6 +301,21 @@ func (s *Subscriber) emit(ctx context.Context, stream string, out chan<- *messag
 	}()
 
 	return true
+}
+
+// ack acknowledges an entry on a context detached from the subscription (not
+// the message context) so a shutdown in progress still records completed
+// work, and so emit's cancelMsgCtx cannot race-abort the very XACK it is
+// meant to follow.
+func (sc *subscription) ack(ctx context.Context, id string) {
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+	defer cancel()
+	if err := sc.sub.reader.Ack(ackCtx, sc.stream, id); err != nil {
+		sc.sub.logger.Error("failed to ack stream entry", err, wm.LogFields{
+			"stream":   sc.stream,
+			"entry_id": id,
+		})
+	}
 }
 
 // decodeEntry converts a stream entry into a watermill message using the
@@ -290,21 +331,21 @@ func decodeEntry(e internalredis.Entry, attempt int64) (*message.Message, error)
 	return msg, nil
 }
 
-// acquire takes a concurrency slot, reporting false if the subscriber is
-// shutting down instead.
-func (s *Subscriber) acquire(ctx context.Context) bool {
+// acquire takes a concurrency slot on this subscription, reporting false if
+// the subscriber is shutting down instead.
+func (sc *subscription) acquire(ctx context.Context) bool {
 	select {
-	case s.sem <- struct{}{}:
+	case sc.sem <- struct{}{}:
 		return true
-	case <-s.closing:
+	case <-sc.sub.closing:
 		return false
 	case <-ctx.Done():
 		return false
 	}
 }
 
-func (s *Subscriber) release() {
-	<-s.sem
+func (sc *subscription) release() {
+	<-sc.sem
 }
 
 // stopped reports whether the subscriber should stop looping.
@@ -330,8 +371,8 @@ func (s *Subscriber) pause(ctx context.Context, d time.Duration) {
 	}
 }
 
-// Close stops all loops and waits for in-flight messages to settle. It is
-// idempotent.
+// Close stops every subscription's loops and waits for all in-flight
+// messages to settle. It is idempotent.
 func (s *Subscriber) Close() error {
 	s.closeOnce.Do(func() { close(s.closing) })
 	s.wg.Wait()
