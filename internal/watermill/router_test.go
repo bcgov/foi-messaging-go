@@ -42,7 +42,9 @@ func TestRouter_DeliversPayloadAndMetadataToHandler(t *testing.T) {
 		return nil
 	})
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		if err := router.Run(ctx); err != nil {
 			t.Errorf("router.Run: %v", err)
 		}
@@ -69,6 +71,12 @@ func TestRouter_DeliversPayloadAndMetadataToHandler(t *testing.T) {
 	}
 	if err := sub.Close(); err != nil {
 		t.Errorf("sub.Close: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for router.Run to complete")
 	}
 }
 

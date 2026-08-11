@@ -38,8 +38,7 @@ func NewRouter(closeTimeout time.Duration) (*Router, error) {
 // AddHandler subscribes h to stream. name identifies the handler within the
 // router and must be unique.
 func (r *Router) AddHandler(name, stream string, sub *Subscriber, h MessageHandler) {
-	//nolint:staticcheck // AddNoPublisherHandler is specified by the task brief
-	r.router.AddNoPublisherHandler(name, stream, sub, func(msg *message.Message) error {
+	r.router.AddConsumerHandler(name, stream, sub, func(msg *message.Message) error {
 		return h(msg.Context(), msg.Payload, msg.Metadata)
 	})
 }
