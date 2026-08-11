@@ -80,35 +80,30 @@ result, err := publisher.Publish(ctx,
 
 The library generates `event_id`, `timestamp`, and `source`, and injects trace context automatically.
 
-### Consume
+### Consuming events
 
 ```go
-type documentHandler struct{}
+consumer, err := messaging.NewConsumer(cfg)  // cfg.Consumer.Group is required
 
-func (documentHandler) Handle(ctx context.Context, e messaging.Envelope[contracts.DocumentCreatedPayload]) error {
-    // Handlers must be idempotent — see Delivery semantics below.
-    log.Printf("document %s created", e.Payload.EntityID)
-    return nil
-}
-
-cfg := messaging.Config{
-    Source:   "search.service",
-    Redis:    messaging.RedisConfig{Address: "redis:6379"},
-    Consumer: messaging.ConsumerConfig{Group: "search-service"},
-}
-
-consumer, err := messaging.NewConsumer(cfg)
-if err != nil {
-    log.Fatal(err)
-}
-
-messaging.RegisterHandler(consumer, contracts.DocumentCreated, documentHandler{})
+err = messaging.RegisterHandler(consumer, contracts.DocumentCreated, documentHandler{})
 
 // Blocks until ctx is cancelled, then drains in-flight handlers.
-if err := consumer.Run(ctx); err != nil {
-    log.Fatal(err)
-}
+err = consumer.Run(ctx)
 ```
+
+A handler is invoked for every event on its topic whose event type matches and
+whose **major** schema version matches. Within a major version, payload changes
+must be backward-compatible, so a handler registered for `1.0.0` receives
+`1.4.2` too; breaking changes require a new major version and a new `EventDef`.
+
+Events on a subscribed topic that no handler matches are acknowledged and
+skipped — topics are shared, and services consume only the event types they
+care about.
+
+Handlers must be idempotent. Delivery is at-least-once and `EventID` is the
+deduplication key.
+
+See [`examples/consumer`](examples/consumer) for a complete service.
 
 ## Core concepts
 
