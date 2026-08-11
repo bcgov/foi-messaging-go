@@ -1,6 +1,7 @@
 package watermill
 
 import (
+	"context"
 	"fmt"
 
 	wm "github.com/ThreeDotsLabs/watermill"
@@ -16,7 +17,8 @@ type Publisher struct {
 	pub *redisstream.Publisher
 }
 
-// NewPublisher builds a Publisher backed by client.
+// NewPublisher builds a Publisher backed by client. The returned Publisher
+// takes ownership of client and will close it when Close is called.
 func NewPublisher(client *goredis.Client) (*Publisher, error) {
 	pub, err := redisstream.NewPublisher(
 		redisstream.PublisherConfig{
@@ -33,9 +35,12 @@ func NewPublisher(client *goredis.Client) (*Publisher, error) {
 }
 
 // Publish writes payload to topic as a single Redis Streams entry with
-// message id id, carrying metadata as Watermill message metadata.
-func (p *Publisher) Publish(topic string, id string, payload []byte, metadata map[string]string) error {
+// message id id, carrying metadata as Watermill message metadata. ctx
+// governs the publish call and is propagated to the underlying Redis
+// command.
+func (p *Publisher) Publish(ctx context.Context, topic string, id string, payload []byte, metadata map[string]string) error {
 	msg := message.NewMessage(id, payload)
+	msg.SetContext(ctx)
 	for k, v := range metadata {
 		msg.Metadata.Set(k, v)
 	}

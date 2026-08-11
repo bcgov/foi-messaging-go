@@ -60,14 +60,7 @@ func NewPublisher(cfg Config) (*Publisher, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	client := internalredis.NewClient(internalredis.ClientOptions{
-		Address:  cfg.Redis.Address,
-		Username: cfg.Redis.Username,
-		Password: cfg.Redis.Password,
-		TLS:      cfg.Redis.TLS,
-		DB:       cfg.Redis.DB,
-		PoolSize: cfg.Redis.PoolSize,
-	})
+	client := internalredis.NewClient(redisClientOptions(cfg.Redis))
 
 	wmPublisher, err := internalwatermill.NewPublisher(client)
 	if err != nil {
@@ -81,6 +74,10 @@ func NewPublisher(cfg Config) (*Publisher, error) {
 // stream named by cfg.StreamPrefix + ":" + def.Topic. Errors are returned
 // synchronously; the library does not buffer or retry publishes.
 func (p *Publisher) Publish(ctx context.Context, def EventDef, payload any, opts ...PublishOption) (PublishResult, error) {
+	if def.Topic == "" {
+		return PublishResult{}, fmt.Errorf("event def: topic is required")
+	}
+
 	var options publishOptions
 	for _, opt := range opts {
 		opt(&options)
@@ -106,7 +103,7 @@ func (p *Publisher) Publish(ctx context.Context, def EventDef, payload any, opts
 	}
 
 	stream := p.cfg.StreamPrefix + ":" + def.Topic
-	if err := p.wm.Publish(stream, env.EventID, body, map[string]string{}); err != nil {
+	if err := p.wm.Publish(ctx, stream, env.EventID, body, map[string]string{}); err != nil {
 		return PublishResult{}, fmt.Errorf("publishing to stream %q: %w", stream, err)
 	}
 
@@ -116,4 +113,18 @@ func (p *Publisher) Publish(ctx context.Context, def EventDef, payload any, opts
 // Close releases the Publisher's underlying resources.
 func (p *Publisher) Close() error {
 	return p.wm.Close()
+}
+
+// redisClientOptions maps a RedisConfig to the internal/redis client
+// options, so the field mapping can be tested independently of a real
+// Redis connection.
+func redisClientOptions(c RedisConfig) internalredis.ClientOptions {
+	return internalredis.ClientOptions{
+		Address:  c.Address,
+		Username: c.Username,
+		Password: c.Password,
+		TLS:      c.TLS,
+		DB:       c.DB,
+		PoolSize: c.PoolSize,
+	}
 }

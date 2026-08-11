@@ -2,7 +2,8 @@
 // asynchronous messaging library for FOI platform services, built on
 // Watermill and Redis Streams.
 //
-// See docs/foi-messaging-go-prd-v1.1.md for the full design. This is a
-// Phase 0 scaffold: the types and functions described in the PRD are not
-// yet implemented.
+// See docs/foi-messaging-go-prd-v1.1.md for the full design. The publish
+// path (EventDef, Envelope, Config, and Publisher) is implemented; the
+// consumer path (routing, retry, DLQ, and telemetry instrumentation) is
+// not yet implemented.
 package messaging

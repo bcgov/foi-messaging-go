@@ -17,7 +17,8 @@ type ClientOptions struct {
 }
 
 // NewClient builds a go-redis client. Construction does not dial Redis —
-// connections are established lazily on first use.
+// connections are established lazily on first use. The caller (or whatever
+// wraps the returned client) is responsible for closing it.
 func NewClient(opts ClientOptions) *goredis.Client {
 	return goredis.NewClient(&goredis.Options{
 		Addr:      opts.Address,
