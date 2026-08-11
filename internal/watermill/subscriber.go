@@ -266,11 +266,20 @@ func (sc *subscription) emit(ctx context.Context, e internalredis.Entry, attempt
 		return !s.stopped(ctx)
 	}
 
-	// msgCtx is cancelled once this message's ack/nack settles (or the
-	// subscription tears down before that settles), so msg.Context() is
-	// Done() after Ack — the standard Watermill contract, mirroring
+	// msgCtx is cancelled once this message's ack/nack settles, or when
+	// Close tears the subscription down — so msg.Context() is Done() after
+	// Ack, the standard Watermill contract, mirroring
 	// watermill-redisstream's processMessage.
-	msgCtx, cancelMsgCtx := context.WithCancel(ctx)
+	//
+	// It is deliberately detached from ctx. Deriving it from ctx directly
+	// made every in-flight handler's context Done() the instant the caller
+	// cancelled, *before* the router's CloseTimeout drain even began: a
+	// handler doing the canonical `return db.ExecContext(ctx, ...)` failed
+	// immediately with context.Canceled and its entry was redelivered
+	// ClaimMinIdle later, so ShutdownTimeout bought nothing. Handlers now
+	// keep a live context for the whole drain, which is what the drain is
+	// documented to give them.
+	msgCtx, cancelMsgCtx := context.WithCancel(context.WithoutCancel(ctx))
 	msg.SetContext(msgCtx)
 
 	select {
@@ -289,6 +298,8 @@ func (sc *subscription) emit(ctx context.Context, e internalredis.Entry, attempt
 	go func() {
 		defer s.wg.Done()
 		defer sc.release()
+		// Deferred, so it runs after the ack attempt below has completed
+		// and can never race-abort it.
 		defer cancelMsgCtx()
 
 		select {
@@ -297,6 +308,15 @@ func (sc *subscription) emit(ctx context.Context, e internalredis.Entry, attempt
 		case <-msg.Nacked():
 			// Leave the entry pending; the claim loop redelivers it.
 		case <-s.closing:
+			// Close can race a handler that has just acked: both
+			// channels are then ready and select picks between them at
+			// random. Honour an ack that has already landed rather than
+			// leaving completed work to be redelivered.
+			select {
+			case <-msg.Acked():
+				sc.ack(ctx, e.ID)
+			default:
+			}
 		}
 	}()
 

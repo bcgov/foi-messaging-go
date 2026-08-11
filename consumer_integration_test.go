@@ -472,3 +472,98 @@ func (h slowHandler) Handle(_ context.Context, _ messaging.Envelope[documentCrea
 	close(h.finished)
 	return nil
 }
+
+// ctxAwareHandler is the canonical shape of a real handler: it passes its
+// context into blocking work — `return db.ExecContext(ctx, ...)` — and so
+// fails immediately if that context is already cancelled.
+type ctxAwareHandler struct {
+	started chan struct{}
+	work    time.Duration
+
+	mu  sync.Mutex
+	ran bool
+	err error
+}
+
+func (h *ctxAwareHandler) Handle(ctx context.Context, _ messaging.Envelope[documentCreatedPayload]) error {
+	close(h.started)
+
+	var err error
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-time.After(h.work):
+	}
+
+	h.mu.Lock()
+	h.ran, h.err = true, err
+	h.mu.Unlock()
+	return err
+}
+
+func (h *ctxAwareHandler) result() (bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.ran, h.err
+}
+
+// TestConsumer_ShutdownGivesInFlightHandlerALiveContext is the assertion
+// TestConsumer_ShutdownDrainsInFlightHandler structurally cannot make: its
+// slowHandler ignores its context and sleeps unpreemptibly, so it completes
+// on the same schedule whether or not the drain works.
+//
+// A handler that honours its context is the normal case, and the drain the
+// library documents is worthless to it if the message context is cancelled
+// the instant shutdown begins: the handler fails with context.Canceled,
+// the message nacks, and it is redelivered ClaimMinIdle later. In-flight
+// handlers must instead keep a live context for the whole ShutdownTimeout.
+func TestConsumer_ShutdownGivesInFlightHandlerALiveContext(t *testing.T) {
+	cfg := consumeFixture(t)
+
+	publisher, err := messaging.NewPublisher(cfg)
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	consumer, err := messaging.NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+
+	// Well inside the 5s ShutdownTimeout the fixture configures.
+	handler := &ctxAwareHandler{started: make(chan struct{}), work: 500 * time.Millisecond}
+	if err := messaging.RegisterHandler(consumer, documentCreated, handler); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	stop := runConsumer(t, consumer)
+
+	if _, err := publisher.Publish(context.Background(), documentCreated,
+		documentCreatedPayload{EntityID: "e1", Name: "ctx.pdf"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	select {
+	case <-handler.started:
+	case <-time.After(20 * time.Second):
+		t.Fatal("timed out waiting for the handler to start")
+	}
+
+	// Shut down while the handler is mid-flight.
+	stop()
+
+	ran, handlerErr := handler.result()
+	if !ran {
+		t.Fatal("consumer.Run returned before the in-flight handler completed")
+	}
+	if handlerErr != nil {
+		t.Errorf("handler returned %v; a handler in flight when shutdown begins must keep "+
+			"a live context for the whole ShutdownTimeout, not be cancelled at the start of the drain",
+			handlerErr)
+	}
+
+	// A handler that completed during the drain must have had its entry
+	// acked, not left pending for a redelivery ClaimMinIdle later.
+	waitForPendingCountZero(t, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
+}
