@@ -15,6 +15,8 @@ linters:
           deny:
             - pkg: github.com/ThreeDotsLabs/watermill
               desc: "Watermill must stay inside internal/ (PRD §12, §21)"
+            - pkg: github.com/ThreeDotsLabs/watermill-redisstream
+              desc: "watermill-redisstream must stay inside internal/ (PRD §12, §21)"
             - pkg: github.com/redis/go-redis
               desc: "go-redis must stay inside internal/ (PRD §12, §21)"
 formatters:
