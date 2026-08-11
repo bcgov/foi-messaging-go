@@ -1,0 +1,22 @@
+version: "2"
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - unused
+  settings:
+    depguard:
+      rules:
+        internal-only:
+          files:
+            - "!**/internal/**"
+          deny:
+            - pkg: github.com/ThreeDotsLabs/watermill
+              desc: "Watermill must stay inside internal/ (PRD §12, §21)"
+            - pkg: github.com/redis/go-redis
+              desc: "go-redis must stay inside internal/ (PRD §12, §21)"
+formatters:
+  enable:
+    - gofmt
+    - goimports
