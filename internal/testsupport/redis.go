@@ -76,3 +76,20 @@ func ReadStreamEntries(ctx context.Context, addr string, stream string) ([]Strea
 	}
 	return entries, nil
 }
+
+// PendingCount connects to addr and returns the number of pending (delivered
+// but not yet acknowledged) entries for group on stream, via XPENDING. It is
+// used by integration tests to assert that a consumer actually acknowledged
+// every event it processed — including ones it deliberately skipped —
+// rather than merely observing the events a handler received, which cannot
+// distinguish "acked" from "delivered but silently left pending forever".
+func PendingCount(ctx context.Context, addr, stream, group string) (int64, error) {
+	client := goredis.NewClient(&goredis.Options{Addr: addr})
+	defer func() { _ = client.Close() }()
+
+	summary, err := client.XPending(ctx, stream, group).Result()
+	if err != nil {
+		return 0, fmt.Errorf("reading pending entries for stream %q group %q: %w", stream, group, err)
+	}
+	return summary.Count, nil
+}

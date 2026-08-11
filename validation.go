@@ -11,8 +11,8 @@ var (
 )
 
 // validateEnvelope checks required fields, event_type format, schema_version
-// format, and timestamp presence. Used at publish time (Task 6) and, in a
-// later phase, at consume time.
+// format, and timestamp presence. Used at publish time and, on every
+// consumed message, at dispatch.
 func validateEnvelope[T any](e Envelope[T]) error {
 	if e.EventID == "" {
 		return fmt.Errorf("envelope: event_id is required")

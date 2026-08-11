@@ -452,3 +452,46 @@ against the code 2a produces.
 - the delivery-attempt cap, read from `_foi_delivery_attempt` before dispatch
 - `dlq.go`: the exported `DeadLetter` wrapper contract (PRD §14), published to
   `{StreamPrefix}:{topic}.dlq` through an internally constructed publisher
+
+## 10. Carried forward from Phase 2a's final review
+
+Recorded here because these outlived the implementation and Phase 2b must not
+rediscover them.
+
+### Constraints on Phase 2b
+
+- **The delivery counter has no route to a handler.** `_foi_delivery_attempt`
+  is stamped by the subscriber, reaches `MessageHandler`, and is then discarded
+  by `Consumer.Run`'s dispatch closure. The cap can read it inside `dispatch`
+  with no API change. If handlers ever need it, add a context accessor
+  (`messaging.DeliveryAttemptFromContext`) rather than changing
+  `Handler[T].Handle`, which would break every consumer.
+- **`Concurrency` now bounds in-flight handlers per subscribed topic**, not
+  globally across the consumer. The retry middleware must not assume the older
+  global meaning.
+- **Message contexts survive the drain.** `emit` derives them from
+  `context.WithoutCancel` and cancels on subscriber close, so handlers keep a
+  live context for the whole `ShutdownTimeout`. Phase 2b's in-process jittered
+  backoff can rely on that — under the previous wiring it would have burned its
+  entire retry budget instantly on `context.Canceled` during a shutdown.
+- **Poison messages consume concurrency slots, not just redelivery capacity.**
+  Each reclaim sweep claims up to `claimBatchSize` (100) entries, and each
+  occupies a slot through a full claim/decode/release cycle. With a few hundred
+  accumulated poison entries at `Concurrency: 1`, the consumer stops making
+  forward progress on live traffic. The DLQ fixes this; Phase 2b should have a
+  test for it.
+- **`README.md` already documents `AsPermanent` / `AsRetryable` / `AsDiscard`
+  and `DeadLetter`**, marked as planned. Keep those signatures or update the
+  README in the same commit — the risk is drift, not dishonesty.
+
+### Open questions for the platform team
+
+- **Redis version floor.** README states 7.0+. The library's most recent
+  requirement is `XPENDING ... IDLE`, which is Redis **6.2+**. The stated floor
+  is conservative by one minor version. Lowering a published support floor is a
+  product decision, deliberately not taken here.
+- **PRD §13 is stale.** It specifies `XAUTOCLAIM` for the reclaim loop. The
+  implementation uses `XPENDING` + `XCLAIM` because `XAUTOCLAIM` does not return
+  delivery counts, which the Phase 2b cap requires. Both are 6.2+, so the
+  substitution costs nothing in support floor. The PRD should be amended rather
+  than carrying the discrepancy into Phase 2b.
