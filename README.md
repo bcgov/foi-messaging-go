@@ -26,7 +26,7 @@ Application code interacts only with this library. Watermill, Redis Streams, and
 
 ## Requirements
 
-- Go 1.22+ (generics, `slog`)
+- Go 1.25+ (generics, `slog`)
 - Redis 7.0+ (Redis Streams with `XAUTOCLAIM`)
 
 ## Installation
