@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 .idea/
 .vscode/
+
+# Claude Code worktrees (harness-managed, never committed)
+.claude/worktrees/
