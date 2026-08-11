@@ -17,8 +17,8 @@ Application code interacts only with this library. Watermill, Redis Streams, and
 - Standard, strongly-typed event envelope with generic payloads
 - Publisher and consumer APIs keyed on a shared typed `EventDef` (topic + type + version)
 - Automatic serialization, routing, and handler dispatch
-- At-least-once delivery with three-layer retry and poison-message protection
-- Dead Letter Queue with a defined wrapper contract
+- *(Planned: Phase 2b)* At-least-once delivery with three-layer retry and poison-message protection
+- *(Planned: Phase 2b)* Dead Letter Queue with a defined wrapper contract
 - Correlation-ID propagation across service chains
 - OpenTelemetry tracing and Prometheus metrics out of the box
 - Structured logging via `slog`
@@ -137,7 +137,9 @@ The library is **at-least-once**. Three consequences are application obligations
 
 ## Error handling
 
-Handlers classify failures by wrapping the returned error:
+> **Planned for Phase 2b — not yet implemented.**
+
+Handlers will classify failures by wrapping the returned error:
 
 ```go
 return messaging.AsPermanent(err) // → Dead Letter Queue, then ACK
@@ -145,11 +147,13 @@ return messaging.AsRetryable(err) // → retried (also the default for unclassif
 return messaging.AsDiscard(err)   // → acknowledged without retry
 ```
 
-Retries run in three layers: in-process immediate retries, Redis Streams pending-and-reclaim redelivery, and a `MaxDeliveryAttempts` cap that routes poison messages to the DLQ regardless of classification.
+Retries will run in three layers: in-process immediate retries, Redis Streams pending-and-reclaim redelivery, and a `MaxDeliveryAttempts` cap that routes poison messages to the DLQ regardless of classification.
 
 ## Dead Letter Queue
 
-Permanent failures and messages exceeding the delivery cap are published to `<topic>.dlq` using an exported `messaging.DeadLetter` wrapper that preserves the original envelope byte-for-byte alongside failure metadata, so replay tooling can republish without transformation.
+> **Planned for Phase 2b — not yet implemented.**
+
+Permanent failures and messages exceeding the delivery cap will be published to `<topic>.dlq` using an exported `messaging.DeadLetter` wrapper that preserves the original envelope byte-for-byte alongside failure metadata, so replay tooling can republish without transformation.
 
 ## Configuration
 
