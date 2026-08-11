@@ -6,6 +6,7 @@ package testsupport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
@@ -22,12 +23,20 @@ func StartRedis(ctx context.Context) (addr string, terminate func(context.Contex
 
 	host, err := container.Host(ctx)
 	if err != nil {
-		return "", nil, fmt.Errorf("resolving redis container host: %w", err)
+		hostErr := fmt.Errorf("resolving redis container host: %w", err)
+		if termErr := container.Terminate(ctx); termErr != nil {
+			return "", nil, errors.Join(hostErr, fmt.Errorf("terminating redis container after host resolution failure: %w", termErr))
+		}
+		return "", nil, hostErr
 	}
 
 	port, err := container.MappedPort(ctx, "6379/tcp")
 	if err != nil {
-		return "", nil, fmt.Errorf("resolving redis container port: %w", err)
+		portErr := fmt.Errorf("resolving redis container port: %w", err)
+		if termErr := container.Terminate(ctx); termErr != nil {
+			return "", nil, errors.Join(portErr, fmt.Errorf("terminating redis container after port resolution failure: %w", termErr))
+		}
+		return "", nil, portErr
 	}
 
 	terminate = func(ctx context.Context) error {
