@@ -10,7 +10,7 @@ func TestNewClient_SetsOptions(t *testing.T) {
 		DB:       2,
 		PoolSize: 15,
 	})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	opts := client.Options()
 	if opts.Addr != "localhost:6380" {
