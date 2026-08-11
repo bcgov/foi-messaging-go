@@ -78,7 +78,7 @@ result, err := publisher.Publish(ctx,
 // result.EventID, result.Timestamp
 ```
 
-The library generates `event_id`, `timestamp`, and `source`, and injects trace context automatically.
+The library generates `event_id` and `timestamp`. Correlation IDs are resolved from publish options, context, or generated as a UUIDv7.
 
 ### Consuming events
 
@@ -169,7 +169,7 @@ cfg := messaging.Config{
 }
 ```
 
-Redis auth/TLS, pool sizing, consumer concurrency, claim intervals, delivery caps, retry backoff, and telemetry providers are all configurable. See the [full configuration reference](docs/foi-messaging-go-prd-v1.1.md#17-configuration).
+Redis auth/TLS, pool sizing, consumer concurrency, and claim intervals are all configurable with working defaults. Delivery caps (`MaxDeliveryAttempts`) and retry backoff settings (`RetryConfig`) are accepted and validated but are not yet enforced — they take effect in Phase 2b. See the [full configuration reference](docs/foi-messaging-go-prd-v1.1.md#17-configuration).
 
 ## Observability
 
@@ -179,14 +179,7 @@ Consumers emit structured `slog` logs on validation errors and handler dispatch.
 
 ## Testing
 
-The `testing/` package lets applications unit-test handlers and publish paths without a Redis instance:
-
-```go
-pub := messagingtest.Publisher{}
-// ... exercise code that publishes, then assert on pub.Published
-
-err := messagingtest.Deliver(handler, messagingtest.Envelope(payload))
-```
+> **Planned for Phase 4** — The `testing/` package will let applications unit-test handlers and publish paths without a Redis instance.
 
 Integration tests in this repository use [Testcontainers](https://testcontainers.com/) against real Redis.
 
