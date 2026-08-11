@@ -5,8 +5,9 @@ import "context"
 type correlationIDContextKey struct{}
 
 // contextWithCorrelationID returns a context carrying the given correlation
-// ID. Used internally when resolving the correlation ID to publish with
-// (Task 6), and by a later consumer phase to propagate it to handlers.
+// ID. Used internally when resolving the correlation ID to publish with,
+// and at dispatch to propagate the consumed event's correlation ID into the
+// handler's context.
 func contextWithCorrelationID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, correlationIDContextKey{}, id)
 }

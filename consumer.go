@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -185,23 +186,30 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 	runErr := router.Run(ctx)
 
+	// Every teardown step runs, and every failure is reported: returning
+	// only the first would mask a teardown failure behind an earlier one.
 	closeErr := router.Close()
-	subCloseErr := subscriber.Close()
-	readerErr := c.closeReader(reader)
-
-	if runErr != nil {
-		return runErr
-	}
 	if closeErr != nil {
-		return fmt.Errorf("closing router: %w", closeErr)
+		// Watermill's Close returns "router close timeout" but still
+		// closes its done channel, so without this the drain expiring —
+		// handlers abandoned mid-processing, their messages left pending —
+		// would be invisible.
+		c.cfg.Telemetry.Logger.Error("messaging: router did not shut down cleanly",
+			"shutdown_timeout", c.cfg.Consumer.ShutdownTimeout, "error", closeErr)
+		closeErr = fmt.Errorf("closing router: %w", closeErr)
 	}
+
+	subCloseErr := subscriber.Close()
 	if subCloseErr != nil {
-		return fmt.Errorf("closing subscriber: %w", subCloseErr)
+		subCloseErr = fmt.Errorf("closing subscriber: %w", subCloseErr)
 	}
+
+	readerErr := c.closeReader(reader)
 	if readerErr != nil {
-		return fmt.Errorf("closing redis client: %w", readerErr)
+		readerErr = fmt.Errorf("closing redis client: %w", readerErr)
 	}
-	return nil
+
+	return errors.Join(runErr, closeErr, subCloseErr, readerErr)
 }
 
 // closeReader closes reader and clears it from Consumer state so a later
@@ -289,15 +297,29 @@ func (c *Consumer) streamName(topic string) string {
 	return c.cfg.StreamPrefix + ":" + topic
 }
 
-// Close releases resources held by a Consumer that was created but never
-// run. After Run returns, everything is already released. Close is
-// idempotent and safe to defer unconditionally.
+// Close releases the Redis client held by a Consumer that was constructed
+// but never run. It is idempotent, returns nil when there is nothing to
+// release, and is safe to defer unconditionally.
+//
+// Close is not how a running consumer is stopped. Cancel the context passed
+// to Run: Run drains its handlers and releases everything itself before
+// returning. While Run is in progress — and after it has returned, when
+// there is nothing left to release — Close does nothing and returns nil.
+//
+// That guard matters. Closing the client under a live read loop wedged the
+// consumer permanently and silently: "redis: client is closed" is neither
+// ctx.Done nor a shutdown signal, so the read loop backed off and retried
+// it forever, Run never returned, and the process never exited.
 func (c *Consumer) Close() error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.running {
+		return nil
+	}
+
 	reader := c.reader
 	c.reader = nil
-	c.mu.Unlock()
-
 	if reader == nil {
 		return nil
 	}

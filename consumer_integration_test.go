@@ -368,6 +368,53 @@ func TestConsumer_SkipsUnmatchedEventType(t *testing.T) {
 	waitForPendingCountZero(t, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
 }
 
+// TestConsumer_CloseDuringRunLeavesConsumerWorking is the end-to-end form
+// of the guard in Close: a service that does `go consumer.Run(ctx)` and
+// wires Close into its shutdown handler — a natural misreading of
+// io.Closer — used to close the Redis client under the live read loop.
+// Every read then failed with "redis: client is closed", which is neither
+// ctx.Done nor a shutdown signal, so the loop retried forever, Run never
+// returned, and the process never exited.
+func TestConsumer_CloseDuringRunLeavesConsumerWorking(t *testing.T) {
+	cfg := consumeFixture(t)
+
+	publisher, err := messaging.NewPublisher(cfg)
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	consumer, err := messaging.NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	handler := newCollectingHandler(0)
+	if err := messaging.RegisterHandler(consumer, documentCreated, handler); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	// runConsumer's cleanup asserts Run returns within 30s of cancellation.
+	runConsumer(t, consumer)
+
+	// Give Run time to build its client and start reading, then Close.
+	time.Sleep(2 * time.Second)
+	if err := consumer.Close(); err != nil {
+		t.Fatalf("Close during Run must return nil, got: %v", err)
+	}
+
+	if _, err := publisher.Publish(context.Background(), documentCreated,
+		documentCreatedPayload{EntityID: "e1", Name: "after-close.pdf"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	select {
+	case <-handler.notify:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the consumer stopped delivering after Close was called during Run; " +
+			"Close must not tear down a running consumer's Redis client")
+	}
+}
+
 func TestConsumer_ReplaysEventsPublishedBeforeItStarted(t *testing.T) {
 	cfg := consumeFixture(t)
 

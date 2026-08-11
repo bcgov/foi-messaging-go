@@ -185,8 +185,50 @@ func TestValidateConsumer_RejectsNegativeConcurrency(t *testing.T) {
 		},
 	}
 
-	if err := cfg.validateConsumer(); err == nil {
+	err := cfg.validateConsumer()
+	if err == nil {
 		t.Fatal("expected an error for negative Concurrency")
+	}
+	if !strings.Contains(err.Error(), "Consumer.Concurrency") {
+		t.Errorf("error = %q, want it to name Consumer.Concurrency", err)
+	}
+}
+
+// TestValidateConsumer_RejectsNegativeDurations covers the gap that let a
+// negative ClaimInterval through: zero means "use the default", so a
+// negative value skipped defaulting, then passed the
+// ClaimMinIdle >= ClaimInterval check (any ClaimMinIdle beats a negative
+// interval), and finally failed the subscriber's `claimInterval > 0` guard
+// — silently disabling reclaim, so nacked messages were never redelivered
+// and nothing reported it.
+func TestValidateConsumer_RejectsNegativeDurations(t *testing.T) {
+	cases := []struct {
+		name     string
+		mutate   func(*ConsumerConfig)
+		wantName string
+	}{
+		{"claim interval", func(c *ConsumerConfig) { c.ClaimInterval = -time.Second }, "Consumer.ClaimInterval"},
+		{"claim min idle", func(c *ConsumerConfig) { c.ClaimMinIdle = -time.Second }, "Consumer.ClaimMinIdle"},
+		{"shutdown timeout", func(c *ConsumerConfig) { c.ShutdownTimeout = -time.Second }, "Consumer.ShutdownTimeout"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				Source:   "test.service",
+				Redis:    RedisConfig{Address: "localhost:6379"},
+				Consumer: ConsumerConfig{Group: "test-group"},
+			}
+			tc.mutate(&cfg.Consumer)
+
+			err := cfg.validateConsumer()
+			if err == nil {
+				t.Fatalf("expected an error for a negative %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantName) {
+				t.Errorf("error = %q, want it to name %s", err, tc.wantName)
+			}
+		})
 	}
 }
 

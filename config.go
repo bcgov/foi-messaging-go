@@ -75,9 +75,11 @@ type RetryConfig struct {
 	MaxBackoff          time.Duration
 }
 
-// TelemetryConfig configures observability integration. The providers and
-// logger are defaulted by Validate but are not yet used by Publish — span
-// creation and metric emission are added in a later phase.
+// TelemetryConfig configures observability integration. Logger is defaulted
+// by Validate and is used throughout the consume path — the subscriber's
+// loops, dispatch, and watermill's own router logs all go through it. The
+// tracer and meter providers are defaulted but inert: span creation and
+// metric emission arrive in Phase 3.
 type TelemetryConfig struct {
 	TracerProvider trace.TracerProvider
 	MeterProvider  metric.MeterProvider
@@ -86,8 +88,8 @@ type TelemetryConfig struct {
 }
 
 // Config is the library's single configuration object. A minimal config is
-// three fields: Source, Redis.Address, and (for consumers, in a later
-// phase) Consumer.Group. Every other field has a working default.
+// three fields: Source, Redis.Address, and — for consumers — Consumer.Group.
+// Every other field has a working default.
 type Config struct {
 	Source       string
 	StreamPrefix string
@@ -108,8 +110,8 @@ const (
 )
 
 // Validate checks required fields and fills in defaults for everything
-// else. Called by NewPublisher; a later consumer phase adds an additional
-// Consumer.Group check in NewConsumer.
+// else. Called by NewPublisher, and by NewConsumer — which then also calls
+// validateConsumer for the consumer-only fields.
 func (c *Config) Validate() error {
 	if c.Source == "" {
 		return fmt.Errorf("config: Source is required")
@@ -158,6 +160,22 @@ func (c *Config) validateConsumer() error {
 	}
 	if c.Consumer.Concurrency < 0 {
 		return fmt.Errorf("config: Consumer.Concurrency must not be negative, got %d", c.Consumer.Concurrency)
+	}
+
+	// Negative durations have to be rejected explicitly: zero means "use the
+	// default" here, so a negative value would sail past the defaulting and
+	// past the ClaimMinIdle >= ClaimInterval check below (any ClaimMinIdle
+	// exceeds a negative ClaimInterval), then silently disable the reclaim
+	// loop, which starts only when claimInterval > 0. Nacked messages would
+	// never be redelivered and nothing would report why.
+	if c.Consumer.ClaimInterval < 0 {
+		return fmt.Errorf("config: Consumer.ClaimInterval must not be negative, got %v", c.Consumer.ClaimInterval)
+	}
+	if c.Consumer.ClaimMinIdle < 0 {
+		return fmt.Errorf("config: Consumer.ClaimMinIdle must not be negative, got %v", c.Consumer.ClaimMinIdle)
+	}
+	if c.Consumer.ShutdownTimeout < 0 {
+		return fmt.Errorf("config: Consumer.ShutdownTimeout must not be negative, got %v", c.Consumer.ShutdownTimeout)
 	}
 
 	if c.Consumer.Concurrency == 0 {

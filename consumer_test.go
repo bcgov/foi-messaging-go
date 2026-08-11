@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
 )
 
 func testConsumerConfig() Config {
@@ -112,6 +114,43 @@ func TestRegisterHandler_RejectsRegistrationAfterRun(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Run") {
 		t.Errorf("error = %q, want it to mention Run", err)
+	}
+}
+
+// TestConsumer_CloseDoesNothingWhileRunning pins the guard that keeps a
+// natural misreading of io.Closer from wedging the process. Closing the
+// Redis client under a live read loop makes every ReadNew return
+// "redis: client is closed", which is neither ctx.Done nor a shutdown
+// signal: the loop backs off and retries it forever and Run never returns.
+func TestConsumer_CloseDoesNothingWhileRunning(t *testing.T) {
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+
+	// Stand in for what Run installs. Construction dials nothing.
+	client := internalredis.NewClient(internalredis.ClientOptions{Address: "127.0.0.1:1"})
+	reader := internalredis.NewStreamReader(client, "test-group", "test-consumer")
+	consumer.mu.Lock()
+	consumer.reader = reader
+	consumer.mu.Unlock()
+	consumer.markRunning()
+
+	if err := consumer.Close(); err != nil {
+		t.Fatalf("Close on a running consumer must return nil, got: %v", err)
+	}
+
+	consumer.mu.Lock()
+	stillHeld := consumer.reader
+	consumer.mu.Unlock()
+	if stillHeld == nil {
+		t.Error("Close cleared a running consumer's reader; only Run may release it")
+	}
+
+	// go-redis returns ErrClosed from a second Close on the same client, so
+	// this succeeding is proof the first Close left the client alone.
+	if err := reader.Close(); err != nil {
+		t.Errorf("the Redis client was closed under the running consumer: %v", err)
 	}
 }
 
