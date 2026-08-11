@@ -8,7 +8,7 @@ import (
 )
 
 type testPayload struct {
-	Name string
+	Name string `json:"name"`
 }
 
 func TestNewEnvelope_PopulatesFields(t *testing.T) {
