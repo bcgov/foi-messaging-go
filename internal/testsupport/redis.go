@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 
+	goredis "github.com/redis/go-redis/v9"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 )
 
@@ -44,4 +45,34 @@ func StartRedis(ctx context.Context) (addr string, terminate func(context.Contex
 	}
 
 	return fmt.Sprintf("%s:%s", host, port.Port()), terminate, nil
+}
+
+// StreamEntry is a single raw Redis Streams entry.
+type StreamEntry struct {
+	ID     string
+	Fields map[string]string
+}
+
+// ReadStreamEntries connects to addr and reads every entry currently on
+// stream, for integration-test assertions against what a Publisher wrote.
+func ReadStreamEntries(ctx context.Context, addr string, stream string) ([]StreamEntry, error) {
+	client := goredis.NewClient(&goredis.Options{Addr: addr})
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.XRange(ctx, stream, "-", "+").Result()
+	if err != nil {
+		return nil, fmt.Errorf("reading stream %q: %w", stream, err)
+	}
+
+	entries := make([]StreamEntry, 0, len(raw))
+	for _, msg := range raw {
+		fields := make(map[string]string, len(msg.Values))
+		for k, v := range msg.Values {
+			if s, ok := v.(string); ok {
+				fields[k] = s
+			}
+		}
+		entries = append(entries, StreamEntry{ID: msg.ID, Fields: fields})
+	}
+	return entries, nil
 }
