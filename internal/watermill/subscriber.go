@@ -29,8 +29,6 @@ var ErrNoReader = errors.New("subscriber: Reader is required")
 const (
 	defaultBlockTime = time.Second
 	// claimBatchSize bounds one reclaim sweep, not the total pending set.
-	// Unused until Task 3 wires up the claim loop.
-	//nolint:unused // reserved for Task 3's claim loop
 	claimBatchSize = int64(100)
 	// readErrorBackoff throttles a failing read loop so a broken connection
 	// does not spin.
@@ -123,11 +121,21 @@ func (s *Subscriber) Subscribe(ctx context.Context, stream string) (<-chan *mess
 		defer close(out)
 
 		var loops sync.WaitGroup
+
 		loops.Add(1)
 		go func() {
 			defer loops.Done()
 			s.readLoop(ctx, stream, out)
 		}()
+
+		if s.claimInterval > 0 {
+			loops.Add(1)
+			go func() {
+				defer loops.Done()
+				s.claimLoop(ctx, stream, out)
+			}()
+		}
+
 		loops.Wait()
 	}()
 
@@ -157,6 +165,54 @@ func (s *Subscriber) readLoop(ctx context.Context, stream string, out chan<- *me
 		// surplus would have nowhere to run.
 		if !s.emit(ctx, stream, out, entries[0], 1) {
 			return
+		}
+	}
+}
+
+// claimLoop implements PRD §13 Layer 2. Every ClaimInterval it looks for
+// entries pending longer than ClaimMinIdle and reclaims them, which is how
+// nacked messages are redelivered and how messages survive a crashed
+// consumer. Reclaimed messages arrive out of order relative to the live
+// stream, which is inherent to reclaim.
+func (s *Subscriber) claimLoop(ctx context.Context, stream string, out chan<- *message.Message) {
+	ticker := time.NewTicker(s.claimInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.closing:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		pending, err := s.reader.PendingOverIdle(ctx, stream, s.claimMinIdle, claimBatchSize)
+		if err != nil {
+			s.pause(ctx, readErrorBackoff)
+			continue
+		}
+
+		for _, p := range pending {
+			if !s.acquire(ctx) {
+				return
+			}
+
+			entries, err := s.reader.Claim(ctx, stream, s.claimMinIdle, []string{p.ID})
+			if err != nil || len(entries) == 0 {
+				// Lost the race to another instance, or the entry is gone.
+				s.release()
+				if s.stopped(ctx) {
+					return
+				}
+				continue
+			}
+
+			// XPENDING reports deliveries that already happened; the XCLAIM
+			// just issued is the next one.
+			if !s.emit(ctx, stream, out, entries[0], p.RetryCount+1) {
+				return
+			}
 		}
 	}
 }

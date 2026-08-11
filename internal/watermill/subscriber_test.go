@@ -302,3 +302,83 @@ func TestNewSubscriber_RejectsMissingReader(t *testing.T) {
 		t.Errorf("err = %v, want ErrNoReader", err)
 	}
 }
+
+func TestSubscriber_ClaimLoopRedeliversWithIncrementedAttempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader := newFakeReader()
+	// One entry already delivered once and left pending.
+	reader.pending = []internalredis.PendingEntry{
+		{ID: "1-0", RetryCount: 1, Idle: time.Second},
+	}
+	reader.claimed["1-0"] = entry("1-0", "event-a", "{}")
+
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:        reader,
+		Concurrency:   1,
+		ClaimInterval: 20 * time.Millisecond,
+		ClaimMinIdle:  10 * time.Millisecond,
+		BlockTime:     10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	out, err := sub.Subscribe(ctx, "stream")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case msg := <-out:
+		if msg.UUID != "event-a" {
+			t.Errorf("UUID = %q, want %q", msg.UUID, "event-a")
+		}
+		// XPENDING reported 1 prior delivery; the XCLAIM just issued is
+		// the second, so the stamped attempt must be 2.
+		if got := msg.Metadata.Get(MetadataDeliveryAttempt); got != "2" {
+			t.Errorf("%s = %q, want %q (RetryCount+1)", MetadataDeliveryAttempt, got, "2")
+		}
+		if got := msg.Metadata.Get(MetadataStreamID); got != "1-0" {
+			t.Errorf("%s = %q, want %q", MetadataStreamID, got, "1-0")
+		}
+		msg.Ack()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a reclaimed message")
+	}
+}
+
+func TestSubscriber_ClaimLoopSkippedWithoutClaimInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader := newFakeReader()
+	reader.pending = []internalredis.PendingEntry{
+		{ID: "1-0", RetryCount: 1, Idle: time.Second},
+	}
+	reader.claimed["1-0"] = entry("1-0", "event-a", "{}")
+
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:      reader,
+		Concurrency: 1,
+		BlockTime:   10 * time.Millisecond,
+		// ClaimInterval left zero: reclaim disabled.
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	out, err := sub.Subscribe(ctx, "stream")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case msg := <-out:
+		t.Fatalf("unexpected reclaim with ClaimInterval unset: %q", msg.UUID)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
