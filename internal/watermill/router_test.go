@@ -80,6 +80,86 @@ func TestRouter_DeliversPayloadAndMetadataToHandler(t *testing.T) {
 	}
 }
 
+// TestRouter_InFlightHandlerKeepsLiveContextDuringDrain is the fast,
+// Redis-free form of the drain guarantee, and covers the two places it can
+// be broken: deriving the message context from the subscribe context, and
+// letting watermill close the shared Subscriber the moment the router
+// context is cancelled (message/router.go's handleClose), which closes the
+// shutdown signal that settles in-flight messages.
+func TestRouter_InFlightHandlerKeepsLiveContextDuringDrain(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader := newFakeReader(entry("1-0", "event-a", "{}"))
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:      reader,
+		Concurrency: 1,
+		BlockTime:   10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+
+	// Well above the handler's 300ms of work.
+	router, err := NewRouter(5*time.Second, nil)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+
+	started := make(chan struct{})
+	handlerErr := make(chan error, 1)
+	router.AddHandler("h", "stream", sub, func(hctx context.Context, _ []byte, _ map[string]string) error {
+		close(started)
+		select {
+		case <-hctx.Done():
+			handlerErr <- hctx.Err()
+		case <-time.After(300 * time.Millisecond):
+			handlerErr <- nil
+		}
+		return nil
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := router.Run(ctx); err != nil {
+			t.Errorf("router.Run: %v", err)
+		}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the handler to start")
+	}
+
+	// Shut down while the handler is mid-flight.
+	cancel()
+
+	select {
+	case err := <-handlerErr:
+		if err != nil {
+			t.Errorf("handler context was cancelled with %v; an in-flight handler must keep "+
+				"a live context for the whole close timeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the handler to finish")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for router.Run to return")
+	}
+
+	if err := router.Close(); err != nil {
+		t.Errorf("router.Close: %v", err)
+	}
+	if err := sub.Close(); err != nil {
+		t.Errorf("sub.Close: %v", err)
+	}
+}
+
 func TestRouter_HandlerErrorLeavesEntryUnacked(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

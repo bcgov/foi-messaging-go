@@ -42,10 +42,31 @@ func NewRouter(closeTimeout time.Duration, logger *slog.Logger) (*Router, error)
 // AddHandler subscribes h to stream. name identifies the handler within the
 // router and must be unique.
 func (r *Router) AddHandler(name, stream string, sub *Subscriber, h MessageHandler) {
-	r.router.AddConsumerHandler(name, stream, sub, func(msg *message.Message) error {
+	r.router.AddConsumerHandler(name, stream, sharedSubscriber{sub}, func(msg *message.Message) error {
 		return h(msg.Context(), msg.Payload, msg.Metadata)
 	})
 }
+
+// sharedSubscriber hands the Subscriber to watermill with its Close
+// suppressed.
+//
+// Watermill closes a handler's subscriber as soon as that handler stops —
+// message/router.go's handleClose, which runs the moment the router context
+// is cancelled and before the CloseTimeout drain — and every handler holds
+// the same Subscriber here. Letting it through would mean the first handler
+// to stop tore down every other topic's subscription, and closed the
+// Subscriber whose shutdown signal settles in-flight messages, cancelling
+// the contexts of the very handlers the drain exists to let finish.
+//
+// The Subscriber's owner is messaging.Consumer.Run, which closes it exactly
+// once after the router has drained. Suppressing the early close costs
+// nothing: each subscription's loops already exit on the handler context,
+// so the message channel still closes and the handler still stops.
+type sharedSubscriber struct {
+	*Subscriber
+}
+
+func (sharedSubscriber) Close() error { return nil }
 
 // Run blocks until ctx is cancelled, then drains in-flight handlers within
 // the configured close timeout.
