@@ -1,7 +1,19 @@
 package messaging
 
-// Correlation ID propagation through context.Context will live here:
-// reading an inbound correlation ID and placing it for outbound
-// publishes within the same handler chain.
-// See PRD §5 (Correlation ID Semantics). Not yet implemented — Phase 0
-// scaffolding only.
+import "context"
+
+type correlationIDContextKey struct{}
+
+// contextWithCorrelationID returns a context carrying the given correlation
+// ID. Used internally when resolving the correlation ID to publish with
+// (Task 6), and by a later consumer phase to propagate it to handlers.
+func contextWithCorrelationID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, correlationIDContextKey{}, id)
+}
+
+// correlationIDFromContext reads a correlation ID previously placed by
+// contextWithCorrelationID. ok is false if none is present.
+func correlationIDFromContext(ctx context.Context) (string, bool) {
+	id, ok := ctx.Value(correlationIDContextKey{}).(string)
+	return id, ok
+}
