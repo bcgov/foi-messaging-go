@@ -153,18 +153,23 @@ func (c *Consumer) Run(ctx context.Context) error {
 	c.reader = reader
 	c.mu.Unlock()
 
+	// The application's logger is threaded into both halves: without it the
+	// subscriber's read-loop, claim-loop and ack failures, and watermill's
+	// own handler-error line, all go to a NopLogger or the stdlib logger
+	// and never reach the operator.
 	subscriber, err := internalwatermill.NewSubscriber(internalwatermill.SubscriberOptions{
 		Reader:        reader,
 		Concurrency:   c.cfg.Consumer.Concurrency,
 		ClaimInterval: c.cfg.Consumer.ClaimInterval,
 		ClaimMinIdle:  c.cfg.Consumer.ClaimMinIdle,
+		Logger:        c.cfg.Telemetry.Logger,
 	})
 	if err != nil {
 		_ = c.closeReader(reader)
 		return fmt.Errorf("creating subscriber: %w", err)
 	}
 
-	router, err := internalwatermill.NewRouter(c.cfg.Consumer.ShutdownTimeout)
+	router, err := internalwatermill.NewRouter(c.cfg.Consumer.ShutdownTimeout, c.cfg.Telemetry.Logger)
 	if err != nil {
 		_ = subscriber.Close()
 		_ = c.closeReader(reader)
@@ -173,8 +178,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 	for _, topic := range topics {
 		router.AddHandler(topic, c.streamName(topic), subscriber,
-			func(ctx context.Context, payload []byte, _ map[string]string) error {
-				return c.dispatch(ctx, topic, payload)
+			func(ctx context.Context, payload []byte, metadata map[string]string) error {
+				return c.dispatch(ctx, topic, payload, metadata)
 			})
 	}
 
@@ -217,11 +222,19 @@ func (c *Consumer) closeReader(reader *internalredis.StreamReader) error {
 
 // dispatch decodes one message and routes it to its handler.
 //
+// metadata carries the transport-only fields the subscriber stamped on the
+// message — the Redis entry ID and the delivery attempt. They are logged,
+// never merged into the envelope: PRD §5 keeps transport state out of the
+// event contract. Phase 2b reads the delivery attempt here for the cap.
+//
 // Returning nil acks the message; returning an error nacks it, leaving the
 // entry pending for redelivery. In this phase every failure nacks — error
 // classification, the delivery cap, and the DLQ arrive in Phase 2b.
-func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte) error {
-	log := c.cfg.Telemetry.Logger
+func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, metadata map[string]string) error {
+	log := c.cfg.Telemetry.Logger.With(
+		"stream_id", metadata[internalwatermill.MetadataStreamID],
+		"delivery_attempt", metadata[internalwatermill.MetadataDeliveryAttempt],
+	)
 
 	var env Envelope[json.RawMessage]
 	if err := json.Unmarshal(payload, &env); err != nil {
@@ -258,7 +271,17 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte) e
 	}
 
 	ctx = contextWithCorrelationID(ctx, env.CorrelationID)
-	return handler(ctx, env)
+	if err := handler(ctx, env); err != nil {
+		// Logged here so a handler failure reaches the same slog.Logger
+		// as the other three nack paths above, rather than only
+		// watermill's own "Handler returned error".
+		log.Error("messaging: handler returned error",
+			"topic", topic, "event_type", env.EventType,
+			"schema_version", env.SchemaVersion, "event_id", env.EventID,
+			"error", err)
+		return err
+	}
+	return nil
 }
 
 // streamName maps a logical topic to its Redis stream.

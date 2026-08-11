@@ -3,6 +3,7 @@ package watermill
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strconv"
 	"sync"
 	"testing"
@@ -381,6 +382,100 @@ func TestSubscriber_ClaimLoopSkippedWithoutClaimInterval(t *testing.T) {
 	case msg := <-out:
 		t.Fatalf("unexpected reclaim with ClaimInterval unset: %q", msg.UUID)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// failingReader fails every read, as an unreachable Redis does.
+type failingReader struct{ fakeReader }
+
+var errReadFailed = errors.New("dial tcp: connection refused")
+
+func (f *failingReader) ReadNew(context.Context, string, int64, time.Duration) ([]internalredis.Entry, error) {
+	return nil, errReadFailed
+}
+
+// TestSubscriber_LogsReadFailures pins the loudest failure mode the consume
+// path has. A read that keeps failing is retried forever behind
+// readErrorBackoff: Run never returns and nothing is consumed, so unless
+// the error is logged the consumer is indistinguishable from a healthy idle
+// one.
+func TestSubscriber_LogsReadFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	capture := &capturingHandler{}
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:      &failingReader{},
+		Concurrency: 1,
+		BlockTime:   10 * time.Millisecond,
+		Logger:      slog.New(capture),
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	if _, err := sub.Subscribe(ctx, "stream"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		if r, ok := capture.find("messaging: reading from stream failed"); ok {
+			if r.Level != slog.LevelError {
+				t.Errorf("level = %v, want %v", r.Level, slog.LevelError)
+			}
+			if v, ok := attrValue(r, "stream"); !ok || v.String() != "stream" {
+				t.Errorf("stream attr = %v (present=%v), want %q", v, ok, "stream")
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("a failing read loop logged nothing; a silent no-op consumer is the worst failure mode")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// TestSubscriber_LogsUndecodableEntries covers spec §6's "log ERROR" for an
+// entry that cannot be decoded at the transport layer, which was silent —
+// only the JSON layer's version of the same failure was logged.
+func TestSubscriber_LogsUndecodableEntries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	capture := &capturingHandler{}
+	// Missing the fields DefaultMarshallerUnmarshaller requires.
+	reader := newFakeReader(internalredis.Entry{ID: "1-0", Fields: map[string]any{"junk": "x"}})
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:      reader,
+		Concurrency: 1,
+		BlockTime:   10 * time.Millisecond,
+		Logger:      slog.New(capture),
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	if _, err := sub.Subscribe(ctx, "stream"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		if r, ok := capture.find("messaging: undecodable stream entry"); ok {
+			if v, ok := attrValue(r, "entry_id"); !ok || v.String() != "1-0" {
+				t.Errorf("entry_id = %v (present=%v), want %q", v, ok, "1-0")
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("an undecodable entry was dropped from the loop with no log")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

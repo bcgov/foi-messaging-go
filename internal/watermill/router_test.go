@@ -21,7 +21,7 @@ func TestRouter_DeliversPayloadAndMetadataToHandler(t *testing.T) {
 		t.Fatalf("NewSubscriber: %v", err)
 	}
 
-	router, err := NewRouter(time.Second)
+	router, err := NewRouter(time.Second, nil)
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestRouter_HandlerErrorLeavesEntryUnacked(t *testing.T) {
 		t.Fatalf("NewSubscriber: %v", err)
 	}
 
-	router, err := NewRouter(time.Second)
+	router, err := NewRouter(time.Second, nil)
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}

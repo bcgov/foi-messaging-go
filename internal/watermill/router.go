@@ -3,9 +3,9 @@ package watermill
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
-	wm "github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
 )
 
@@ -23,11 +23,15 @@ type Router struct {
 	router *message.Router
 }
 
-// NewRouter builds a Router whose shutdown drain is bounded by closeTimeout.
-func NewRouter(closeTimeout time.Duration) (*Router, error) {
+// NewRouter builds a Router whose shutdown drain is bounded by closeTimeout
+// and which logs through logger — including watermill's own
+// "Handler returned error" line, which would otherwise go to the stdlib
+// logger in watermill's format and miss the application's log stream
+// entirely. A nil logger falls back to slog's default.
+func NewRouter(closeTimeout time.Duration, logger *slog.Logger) (*Router, error) {
 	router, err := message.NewRouter(
 		message.RouterConfig{CloseTimeout: closeTimeout},
-		wm.NewStdLogger(false, false),
+		newLoggerAdapter(logger),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating router: %w", err)

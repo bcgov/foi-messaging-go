@@ -161,7 +161,7 @@ func TestDispatch_InvokesTypedHandlerAndPropagatesCorrelationID(t *testing.T) {
 		"payload":{"name":"a.pdf"}
 	}`)
 
-	if err := consumer.dispatch(context.Background(), "documents", body); err != nil {
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
 
@@ -201,7 +201,7 @@ func TestDispatch_AcksUnmatchedEventType(t *testing.T) {
 
 	// An unmatched event is a normal outcome, not an error: returning nil
 	// acks it.
-	if err := consumer.dispatch(context.Background(), "documents", body); err != nil {
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err != nil {
 		t.Errorf("dispatch of an unmatched event type must return nil, got: %v", err)
 	}
 	if called {
@@ -234,7 +234,7 @@ func TestDispatch_AcksUnmatchedMajorVersion(t *testing.T) {
 		"payload":{}
 	}`)
 
-	if err := consumer.dispatch(context.Background(), "documents", body); err != nil {
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err != nil {
 		t.Errorf("dispatch across a major version boundary must return nil, got: %v", err)
 	}
 	if called {
@@ -254,7 +254,7 @@ func TestDispatch_ReturnsErrorOnUndecodableEnvelope(t *testing.T) {
 
 	// In Phase 2a an undecodable entry nacks rather than being dropped;
 	// Phase 2b routes it to the DLQ instead.
-	if err := consumer.dispatch(context.Background(), "documents", []byte(`not json`)); err == nil {
+	if err := consumer.dispatch(context.Background(), "documents", []byte(`not json`), nil); err == nil {
 		t.Error("expected an error for an undecodable envelope")
 	}
 }
@@ -278,7 +278,7 @@ func TestDispatch_ReturnsErrorOnInvalidEnvelope(t *testing.T) {
 		"payload":{}
 	}`)
 
-	if err := consumer.dispatch(context.Background(), "documents", body); err == nil {
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
 		t.Error("expected an error for an envelope failing validation")
 	}
 }
@@ -310,7 +310,7 @@ func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
 		"payload":{}
 	}`)
 
-	if err := consumer.dispatch(context.Background(), "documents", body); err == nil {
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
 		t.Error("expected an error for a negative-major schema_version: validateEnvelope must reject it before majorVersion ever runs")
 	}
 }
@@ -339,7 +339,7 @@ func TestDispatch_PropagatesHandlerError(t *testing.T) {
 	}`)
 
 	// Phase 2a nacks on any handler error; Phase 2b classifies instead.
-	if err := consumer.dispatch(context.Background(), "documents", body); err == nil {
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
 		t.Error("expected the handler error to propagate so the message nacks")
 	}
 }
@@ -369,7 +369,7 @@ func TestDispatch_RawHandlerReceivesEveryEventOnTopic(t *testing.T) {
 			"source":"other.service",
 			"payload":{}
 		}`)
-		if err := consumer.dispatch(context.Background(), "documents", body); err != nil {
+		if err := consumer.dispatch(context.Background(), "documents", body, nil); err != nil {
 			t.Fatalf("dispatch %s: %v", eventType, err)
 		}
 	}

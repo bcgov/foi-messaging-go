@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
 
-	wm "github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill-redisstream/pkg/redisstream"
 	"github.com/ThreeDotsLabs/watermill/message"
 
@@ -61,7 +61,11 @@ type SubscriberOptions struct {
 	ClaimInterval time.Duration
 	ClaimMinIdle  time.Duration
 	BlockTime     time.Duration
-	Logger        wm.LoggerAdapter
+	// Logger receives the read loop's, claim loop's and ack path's
+	// failures. Left nil it falls back to slog's default; it is never
+	// discarded, because a consume path that fails silently looks exactly
+	// like a healthy idle one.
+	Logger *slog.Logger
 }
 
 // Subscriber implements watermill's message.Subscriber over Redis Streams,
@@ -73,7 +77,7 @@ type Subscriber struct {
 	claimInterval time.Duration
 	claimMinIdle  time.Duration
 	blockTime     time.Duration
-	logger        wm.LoggerAdapter
+	logger        *slog.Logger
 
 	closing   chan struct{}
 	wg        sync.WaitGroup
@@ -107,7 +111,7 @@ func NewSubscriber(opts SubscriberOptions) (*Subscriber, error) {
 		opts.BlockTime = defaultBlockTime
 	}
 	if opts.Logger == nil {
-		opts.Logger = &wm.NopLogger{}
+		opts.Logger = slog.Default()
 	}
 
 	return &Subscriber{
@@ -189,6 +193,12 @@ func (sc *subscription) readLoop(ctx context.Context) {
 				return
 			}
 			if err != nil {
+				// Unlogged, a read that keeps failing — an
+				// unreachable Redis, say — loops here forever in
+				// silence: Run never returns, nothing is consumed,
+				// and the consumer still looks connected.
+				s.logger.Error("messaging: reading from stream failed",
+					"stream", sc.stream, "error", err)
 				s.pause(ctx, readErrorBackoff)
 			}
 			continue
@@ -224,6 +234,13 @@ func (sc *subscription) claimLoop(ctx context.Context) {
 
 		pending, err := s.reader.PendingOverIdle(ctx, sc.stream, s.claimMinIdle, claimBatchSize)
 		if err != nil {
+			if s.stopped(ctx) {
+				return
+			}
+			// A reclaim sweep that keeps failing means nacked
+			// messages are never redelivered. Say so.
+			s.logger.Error("messaging: scanning pending entries failed",
+				"stream", sc.stream, "error", err)
 			s.pause(ctx, readErrorBackoff)
 			continue
 		}
@@ -239,6 +256,10 @@ func (sc *subscription) claimLoop(ctx context.Context) {
 				sc.release()
 				if s.stopped(ctx) {
 					return
+				}
+				if err != nil {
+					s.logger.Error("messaging: claiming pending entry failed",
+						"stream", sc.stream, "entry_id", p.ID, "error", err)
 				}
 				continue
 			}
@@ -261,7 +282,13 @@ func (sc *subscription) emit(ctx context.Context, e internalredis.Entry, attempt
 	msg, err := decodeEntry(e, attempt)
 	if err != nil {
 		// An entry we cannot even decode is left pending rather than
-		// dropped; Phase 2b routes it to the DLQ.
+		// dropped; Phase 2b routes it to the DLQ. Until then this log is
+		// the only trace of an entry that will re-loop every ClaimMinIdle
+		// forever — spec §6 requires an ERROR for an undecodable
+		// envelope, and only the JSON layer's version of that failure was
+		// being logged.
+		s.logger.Error("messaging: undecodable stream entry",
+			"stream", sc.stream, "entry_id", e.ID, "error", err)
 		sc.release()
 		return !s.stopped(ctx)
 	}
@@ -331,10 +358,8 @@ func (sc *subscription) ack(ctx context.Context, id string) {
 	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 	if err := sc.sub.reader.Ack(ackCtx, sc.stream, id); err != nil {
-		sc.sub.logger.Error("failed to ack stream entry", err, wm.LogFields{
-			"stream":   sc.stream,
-			"entry_id": id,
-		})
+		sc.sub.logger.Error("messaging: acking stream entry failed",
+			"stream", sc.stream, "entry_id", id, "error", err)
 	}
 }
 
