@@ -8,7 +8,7 @@ Standardized asynchronous messaging for FOI platform services — a transport-ag
 
 ## Why this exists
 
-FOI services communicate asynchronously, but today each one implements serialization, routing, retries, correlation, and Redis configuration on its own. This library provides those concerns once, behind a small typed API.
+FOI services communicate asynchronously, but today each one implements serialization, routing, retries, correlation, and Redis configuration on its own. This library provides those concerns once, behind a small typed API — serialization, routing, correlation, and Redis configuration today; retry and dead-lettering in Phase 2b.
 
 Application code interacts only with this library. Watermill, Redis Streams, and go-redis are internal implementation details and never cross the library boundary.
 
@@ -22,12 +22,12 @@ Application code interacts only with this library. Watermill, Redis Streams, and
 - Correlation-ID propagation across service chains
 - *(Planned: Phase 3)* OpenTelemetry tracing and Prometheus metrics
 - Structured logging via `slog`
-- A `testing/` package for unit-testing handlers without Redis
+- *(Planned: Phase 4)* A `testing/` package for unit-testing handlers without Redis
 
 ## Requirements
 
 - Go 1.25+ (generics, `slog`)
-- Redis 7.0+ (Redis Streams with `XAUTOCLAIM`)
+- Redis 7.0+ (Redis Streams consumer groups)
 
 ## Installation
 
@@ -159,7 +159,7 @@ Permanent failures and messages exceeding the delivery cap will be published to 
 
 ## Configuration
 
-A minimal config is three fields; every retry, reclaim, and concurrency knob has a working default.
+A minimal config is three fields; every reclaim and concurrency knob has a working default.
 
 ```go
 cfg := messaging.Config{
@@ -169,11 +169,11 @@ cfg := messaging.Config{
 }
 ```
 
-Redis auth/TLS, pool sizing, consumer concurrency, and claim intervals are all configurable with working defaults. Delivery caps (`MaxDeliveryAttempts`) and retry backoff settings (`RetryConfig`) are accepted and validated but are not yet enforced — they take effect in Phase 2b. See the [full configuration reference](docs/foi-messaging-go-prd-v1.1.md#17-configuration).
+Redis auth/TLS, pool sizing, consumer concurrency, and claim intervals are all configurable with working defaults. Delivery caps (`MaxDeliveryAttempts`) and retry backoff settings (`RetryConfig`) are accepted and defaulted but are not yet read by any code path — they take effect in Phase 2b. See the [full configuration reference](docs/foi-messaging-go-prd-v1.1.md#17-configuration).
 
 ## Observability
 
-Consumers emit structured `slog` logs on validation errors and handler dispatch. Logged fields include `topic`, `event_id`, `event_type` (when a handler is not found), and `error`. Correlation IDs propagate through handler contexts via `context.Context`.
+Consumers emit structured `slog` logs when an envelope cannot be decoded, fails validation, or carries an unparseable schema version, and a debug log when no registered handler matches an event. Logged fields include `topic`, `event_id`, `event_type` (when a handler is not found), and `error`. Correlation IDs propagate through handler contexts via `context.Context`.
 
 > **Planned for Phase 3** — OpenTelemetry tracing with linked spans for publish and consume, and Prometheus metrics covering event counts (published/received/processed/failed), retries, and processing latency.
 
@@ -196,7 +196,7 @@ foi-messaging-go/
     └── redis/
 ```
 
-Only the top-level package and `testing/` are imported by applications. All Watermill and Redis code stays in `internal/`, enforced by a golangci-lint `depguard` rule (CI enforcement is planned for a later phase).
+Only the top-level package is imported by applications today; the `testing/` package joins it in Phase 4 (see [Testing](#testing)). All Watermill and Redis code stays in `internal/`, enforced by a golangci-lint `depguard` rule (CI enforcement is planned for a later phase).
 
 ## Roadmap
 
@@ -208,4 +208,4 @@ Full design and rationale live in the [Product Requirements Document](docs/foi-m
 
 ## License
 
-_TODO: add license._
+Apache License 2.0 — see [LICENSE](LICENSE).
