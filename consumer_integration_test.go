@@ -5,6 +5,7 @@ package messaging_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -218,8 +219,25 @@ func TestConsumer_ReceivesPublishedEvent(t *testing.T) {
 	waitForPendingCountZero(t, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
 }
 
+// TestConsumer_RedeliversNackedEventViaReclaim is spec §8 integration
+// scenario 2. Counting attempts alone would be satisfied by any redelivery
+// mechanism; what has to be proved is that the reclaimed delivery carries
+// _foi_delivery_attempt == 2, i.e. that the XPENDING RetryCount → +1 →
+// stamp path is right against real Redis and not just against a fake whose
+// pending list the test wrote itself.
+//
+// Recovering that counter is the entire stated reason for not using
+// watermill-redisstream's subscriber, and Phase 2b's delivery-attempt cap
+// compares against exactly this value.
+//
+// The stamped attempt is observed through the log line dispatch already
+// emits for a failing handler, which carries the transport metadata as
+// attributes — no test-only seam and no widening of the public API. The
+// handler fails twice so the second (reclaimed) delivery is itself logged.
 func TestConsumer_RedeliversNackedEventViaReclaim(t *testing.T) {
 	cfg := consumeFixture(t)
+	logs := &logStore{}
+	cfg.Telemetry.Logger = slog.New(&captureHandler{store: logs})
 
 	publisher, err := messaging.NewPublisher(cfg)
 	if err != nil {
@@ -231,8 +249,9 @@ func TestConsumer_RedeliversNackedEventViaReclaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
-	// Fail once so the first delivery nacks and reclaim must redeliver it.
-	handler := newCollectingHandler(1)
+	// Fail twice: delivery 1 nacks, the reclaimed delivery 2 nacks and is
+	// therefore logged with its stamped attempt, delivery 3 succeeds.
+	handler := newCollectingHandler(2)
 	if err := messaging.RegisterHandler(consumer, documentCreated, handler); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
 	}
@@ -243,7 +262,7 @@ func TestConsumer_RedeliversNackedEventViaReclaim(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	deadline := time.After(30 * time.Second)
+	deadline := time.After(60 * time.Second)
 	for {
 		if len(handler.snapshot()) == 1 {
 			break
@@ -255,10 +274,99 @@ func TestConsumer_RedeliversNackedEventViaReclaim(t *testing.T) {
 		}
 	}
 
-	if got := handler.attemptCount(); got < 2 {
-		t.Errorf("attempts = %d, want at least 2 (one failure then a reclaim)", got)
+	if got := handler.attemptCount(); got < 3 {
+		t.Errorf("attempts = %d, want at least 3 (two failures then a reclaim)", got)
+	}
+
+	// The first delivery comes from XREADGROUP and is attempt 1 by
+	// construction; the redelivery comes from XPENDING + XCLAIM and must
+	// carry the recovered counter.
+	if !logs.has(handlerErrorMsg, "delivery_attempt", "1") {
+		t.Errorf("no handler-error log stamped delivery_attempt=1 for the first delivery; got %v",
+			logs.attemptsFor(handlerErrorMsg))
+	}
+	if !logs.has(handlerErrorMsg, "delivery_attempt", "2") {
+		t.Errorf("reclaim redelivery was not stamped delivery_attempt=2; got %v — "+
+			"the XPENDING RetryCount + 1 arithmetic is what Phase 2b's cap compares against",
+			logs.attemptsFor(handlerErrorMsg))
 	}
 }
+
+// handlerErrorMsg is the log dispatch emits when a handler returns an
+// error, carrying the transport metadata the subscriber stamped.
+const handlerErrorMsg = "messaging: handler returned error"
+
+type logRecord struct {
+	msg   string
+	attrs map[string]string
+}
+
+type logStore struct {
+	mu      sync.Mutex
+	records []logRecord
+}
+
+func (s *logStore) add(r logRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records = append(s.records, r)
+}
+
+func (s *logStore) has(msg, key, value string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.records {
+		if r.msg == msg && r.attrs[key] == value {
+			return true
+		}
+	}
+	return false
+}
+
+// attemptsFor lists the delivery attempts seen on a given log message, for
+// failure output.
+func (s *logStore) attemptsFor(msg string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, r := range s.records {
+		if r.msg == msg {
+			out = append(out, r.attrs["delivery_attempt"])
+		}
+	}
+	return out
+}
+
+// captureHandler is a slog.Handler that records what the library logged,
+// including attributes added through Logger.With.
+type captureHandler struct {
+	store *logStore
+	attrs []slog.Attr
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	rec := logRecord{msg: r.Message, attrs: make(map[string]string, r.NumAttrs()+len(h.attrs))}
+	for _, a := range h.attrs {
+		rec.attrs[a.Key] = a.Value.String()
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.String()
+		return true
+	})
+	h.store.add(rec)
+	return nil
+}
+
+func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &captureHandler{
+		store: h.store,
+		attrs: append(append([]slog.Attr(nil), h.attrs...), attrs...),
+	}
+}
+
+func (h *captureHandler) WithGroup(string) slog.Handler { return h }
 
 func TestConsumer_PreservesOrderAtConcurrencyOne(t *testing.T) {
 	cfg := consumeFixture(t)

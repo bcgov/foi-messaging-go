@@ -132,7 +132,7 @@ Routing is two-level: `EventDef.Topic` maps to a Redis stream, and within that s
 The library is **at-least-once**. Three consequences are application obligations:
 
 - **Handlers must be idempotent.** The same event may be delivered more than once; `event_id` is the deduplication key.
-- **Ordering is per-stream and only with `Concurrency: 1`** (the default). Reclaimed messages arrive out of order.
+- **Ordering is per-stream and only with `Concurrency: 1`** (the default). Reclaimed messages arrive out of order. `Concurrency` bounds in-flight handlers *per subscribed topic*, so a consumer registered on three topics at `Concurrency: 3` can be running nine handlers.
 - **Publishing is not transactional with your database.** A crash between a DB write and a publish loses the event. Transactional outbox support is on the roadmap, not in the initial release.
 
 ## Error handling
