@@ -2,7 +2,7 @@
 
 Standardized asynchronous messaging for FOI platform services — a transport-agnostic Go library built on [Watermill](https://watermill.io/) and Redis Streams.
 
-> **Status: early development (pre-v1.0).** The public API described here reflects the design in [PRD v1.1](docs/PRD.md) and is being implemented. It is not yet stable and should not be adopted by production services until v1.0.0 is tagged.
+> **Status: early development (pre-v1.0).** The public API described here reflects the design in [PRD v1.1](docs/foi-messaging-go-prd-v1.1.md) and is being implemented. It is not yet stable and should not be adopted by production services until v1.0.0 is tagged.
 
 ---
 
@@ -32,10 +32,8 @@ Application code interacts only with this library. Watermill, Redis Streams, and
 ## Installation
 
 ```bash
-go get github.com/foi-platform/foi-messaging-go
+go get github.com/bcgov/foi-messaging-go
 ```
-
-> Replace the module path with your actual repository path once the repo is created.
 
 ## Quick start
 
@@ -46,7 +44,7 @@ Event contracts live in a shared package and are imported by both producers and 
 ```go
 package contracts
 
-import messaging "github.com/foi-platform/foi-messaging-go"
+import messaging "github.com/bcgov/foi-messaging-go"
 
 type DocumentCreatedPayload struct {
     EntityID string `json:"entity_id"`
@@ -132,7 +130,7 @@ type Envelope[T any] struct {
 
 ### Routing
 
-Routing is two-level: `EventDef.Topic` maps to a Redis stream, and within that stream messages dispatch to handlers by `event_type` + **major** schema version. A handler registered for `1.0.0` receives `1.x.y` events, so producers can add optional fields without a coordinated consumer release. See [Schema versioning](docs/PRD.md#11-schema-versioning).
+Routing is two-level: `EventDef.Topic` maps to a Redis stream, and within that stream messages dispatch to handlers by `event_type` + **major** schema version. A handler registered for `1.0.0` receives `1.x.y` events, so producers can add optional fields without a coordinated consumer release. See [Schema versioning](docs/foi-messaging-go-prd-v1.1.md#11-schema-versioning).
 
 ### Delivery semantics
 
@@ -170,7 +168,7 @@ cfg := messaging.Config{
 }
 ```
 
-Redis auth/TLS, pool sizing, consumer concurrency, claim intervals, delivery caps, retry backoff, and telemetry providers are all configurable. See the [full configuration reference](docs/PRD.md#17-configuration).
+Redis auth/TLS, pool sizing, consumer concurrency, claim intervals, delivery caps, retry backoff, and telemetry providers are all configurable. See the [full configuration reference](docs/foi-messaging-go-prd-v1.1.md#17-configuration).
 
 ## Observability
 
@@ -202,7 +200,7 @@ foi-messaging-go/
     └── redis/
 ```
 
-Only the top-level package and `testing/` are imported by applications. All Watermill and Redis code stays in `internal/`, enforced by a CI lint rule.
+Only the top-level package and `testing/` are imported by applications. All Watermill and Redis code stays in `internal/`, enforced by a golangci-lint `depguard` rule (CI enforcement is planned for a later phase).
 
 ## Roadmap
 
@@ -210,7 +208,7 @@ Planned after v1.0: transactional outbox, a Redis-backed idempotency helper, del
 
 ## Documentation
 
-Full design and rationale live in the [Product Requirements Document](docs/PRD.md).
+Full design and rationale live in the [Product Requirements Document](docs/foi-messaging-go-prd-v1.1.md).
 
 ## License
 
