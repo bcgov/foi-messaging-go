@@ -5,6 +5,7 @@ linters:
     - staticcheck
     - errcheck
     - unused
+    - depguard
   settings:
     depguard:
       rules:
