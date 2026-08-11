@@ -125,17 +125,26 @@ func (c *Consumer) markRunning() bool {
 // cancelled, then drains in-flight handlers within cfg.Consumer.ShutdownTimeout
 // before returning.
 func (c *Consumer) Run(ctx context.Context) error {
+	// The empty-registry check, the already-running check, and the topics
+	// snapshot must happen in one critical section. Splitting them (as an
+	// earlier version did, reading topics then calling a separately locked
+	// markRunning) leaves a window where a concurrent RegisterHandler can
+	// add a topic after topics is captured but before running flips true:
+	// the registration would succeed silently and its topic would never be
+	// subscribed to, with no error anywhere to explain why the handler is
+	// never called.
 	c.mu.Lock()
-	empty := c.registry.isEmpty()
-	topics := c.registry.topicList()
-	c.mu.Unlock()
-
-	if empty {
+	if c.registry.isEmpty() {
+		c.mu.Unlock()
 		return fmt.Errorf("consumer: no handlers registered; register at least one before calling Run")
 	}
-	if !c.markRunning() {
+	if c.running {
+		c.mu.Unlock()
 		return fmt.Errorf("consumer: Run has already been called")
 	}
+	topics := c.registry.topicList()
+	c.running = true
+	c.mu.Unlock()
 
 	client := internalredis.NewClient(redisClientOptions(c.cfg.Redis))
 	reader := internalredis.NewStreamReader(client, c.cfg.Consumer.Group, c.cfg.Consumer.ConsumerName)
@@ -151,14 +160,14 @@ func (c *Consumer) Run(ctx context.Context) error {
 		ClaimMinIdle:  c.cfg.Consumer.ClaimMinIdle,
 	})
 	if err != nil {
-		_ = reader.Close()
+		_ = c.closeReader(reader)
 		return fmt.Errorf("creating subscriber: %w", err)
 	}
 
 	router, err := internalwatermill.NewRouter(c.cfg.Consumer.ShutdownTimeout)
 	if err != nil {
 		_ = subscriber.Close()
-		_ = reader.Close()
+		_ = c.closeReader(reader)
 		return fmt.Errorf("creating router: %w", err)
 	}
 
@@ -173,14 +182,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 	closeErr := router.Close()
 	subCloseErr := subscriber.Close()
-	readerErr := reader.Close()
-
-	// Everything is already released, so clear c.reader: an unconditionally
-	// deferred Close call must be a no-op here, not a second close of an
-	// already-closed Redis client.
-	c.mu.Lock()
-	c.reader = nil
-	c.mu.Unlock()
+	readerErr := c.closeReader(reader)
 
 	if runErr != nil {
 		return runErr
@@ -195,6 +197,22 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return fmt.Errorf("closing redis client: %w", readerErr)
 	}
 	return nil
+}
+
+// closeReader closes reader and clears it from Consumer state so a later
+// Close call sees nothing to close. This is the single call site Run uses
+// to close its reader — on every exit path, not just the normal-teardown
+// one — so c.reader can never be left pointing at an already-closed
+// client. go-redis's connection pool uses a CompareAndSwap guard and
+// returns ErrClosed from a second Close on the same client
+// (internal/pool.ConnPool.Close), so leaving c.reader set after closing it
+// would make a documented-idempotent Consumer.Close call fail.
+func (c *Consumer) closeReader(reader *internalredis.StreamReader) error {
+	err := reader.Close()
+	c.mu.Lock()
+	c.reader = nil
+	c.mu.Unlock()
+	return err
 }
 
 // dispatch decodes one message and routes it to its handler.

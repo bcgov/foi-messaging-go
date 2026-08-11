@@ -283,6 +283,38 @@ func TestDispatch_ReturnsErrorOnInvalidEnvelope(t *testing.T) {
 	}
 }
 
+func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	// dispatch's ordering (json.Unmarshal -> validateEnvelope -> majorVersion
+	// -> registry lookup) is load-bearing: validateEnvelope's
+	// schemaVersionPattern (^\d+\.\d+\.\d+$) rejects a signed major before
+	// majorVersion's strconv.Atoi ever sees it. If dispatch ever called
+	// majorVersion first, "-1" would parse cleanly as major -1 and this
+	// event would be routed (or silently acked) instead of nacked as an
+	// invalid envelope.
+	body := []byte(`{
+		"event_id":"01234567-89ab-7def-8000-000000000000",
+		"event_type":"document.created",
+		"timestamp":"2026-04-23T10:00:00Z",
+		"schema_version":"-1.0.0",
+		"correlation_id":"corr-1",
+		"source":"other.service",
+		"payload":{}
+	}`)
+
+	if err := consumer.dispatch(context.Background(), "documents", body); err == nil {
+		t.Error("expected an error for a negative-major schema_version: validateEnvelope must reject it before majorVersion ever runs")
+	}
+}
+
 func TestDispatch_PropagatesHandlerError(t *testing.T) {
 	consumer, err := NewConsumer(testConsumerConfig())
 	if err != nil {
