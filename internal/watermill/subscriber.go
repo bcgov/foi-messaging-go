@@ -228,14 +228,22 @@ func (s *Subscriber) emit(ctx context.Context, stream string, out chan<- *messag
 		s.release()
 		return !s.stopped(ctx)
 	}
-	msg.SetContext(ctx)
+
+	// msgCtx is cancelled once this message's ack/nack settles (or the
+	// subscription tears down before that settles), so msg.Context() is
+	// Done() after Ack — the standard Watermill contract, mirroring
+	// watermill-redisstream's processMessage.
+	msgCtx, cancelMsgCtx := context.WithCancel(ctx)
+	msg.SetContext(msgCtx)
 
 	select {
 	case out <- msg:
 	case <-s.closing:
+		cancelMsgCtx()
 		s.release()
 		return false
 	case <-ctx.Done():
+		cancelMsgCtx()
 		s.release()
 		return false
 	}
@@ -244,11 +252,14 @@ func (s *Subscriber) emit(ctx context.Context, stream string, out chan<- *messag
 	go func() {
 		defer s.wg.Done()
 		defer s.release()
+		defer cancelMsgCtx()
 
 		select {
 		case <-msg.Acked():
-			// Ack with a context detached from the subscription so a
-			// shutdown in progress still records completed work.
+			// Ack with a context detached from the subscription (not
+			// msgCtx) so a shutdown in progress still records completed
+			// work, and so the cancelMsgCtx() above cannot race-abort the
+			// very XACK it is meant to follow.
 			ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
 			if err := s.reader.Ack(ackCtx, stream, e.ID); err != nil {
