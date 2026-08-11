@@ -126,6 +126,37 @@ func runConsumer(t *testing.T, consumer *messaging.Consumer) func() {
 	return stop
 }
 
+// waitForPendingCountZero polls the pending entries list for group on
+// stream until it reaches zero or deadline elapses. Acks are issued by
+// each message's own per-message goroutine (internal/watermill's emit),
+// which can lag slightly behind a handler returning or a skip decision
+// being made, so this polls rather than asserting immediately.
+//
+// This exists because "the handler received the expected events" cannot
+// distinguish an acked message from one that was silently left pending
+// forever — see dispatch's unmatched-event-type branch, which must ack
+// (return nil) rather than nack, and Phase 2b's not-yet-built DLQ means an
+// unbounded pending list would otherwise go unnoticed.
+func waitForPendingCountZero(t *testing.T, addr, stream, group string) {
+	t.Helper()
+
+	deadline := time.After(10 * time.Second)
+	for {
+		count, err := testsupport.PendingCount(context.Background(), addr, stream, group)
+		if err != nil {
+			t.Fatalf("PendingCount: %v", err)
+		}
+		if count == 0 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("pending entries for stream %q group %q = %d, want 0", stream, group, count)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func TestConsumer_ReceivesPublishedEvent(t *testing.T) {
 	cfg := consumeFixture(t)
 
@@ -183,6 +214,8 @@ func TestConsumer_ReceivesPublishedEvent(t *testing.T) {
 	if received[0].Source != "test.service" {
 		t.Errorf("Source = %q, want %q", received[0].Source, "test.service")
 	}
+
+	waitForPendingCountZero(t, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
 }
 
 func TestConsumer_RedeliversNackedEventViaReclaim(t *testing.T) {
@@ -323,6 +356,16 @@ func TestConsumer_SkipsUnmatchedEventType(t *testing.T) {
 	if received[0].Payload.Name != "wanted.pdf" {
 		t.Errorf("Payload.Name = %q, want %q", received[0].Payload.Name, "wanted.pdf")
 	}
+
+	// Both events must be acknowledged: the unmatched one via the skip
+	// path (dispatch returning nil), the matching one via the handler
+	// returning nil. Checking only what the handler received cannot tell
+	// an ack apart from a silently growing pending entries list — if the
+	// skip path ever regressed to nacking, the matching event would still
+	// arrive right on schedule (Concurrency: 1 only gates on slot release,
+	// not on acknowledgement) and this test would stay green without this
+	// assertion.
+	waitForPendingCountZero(t, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
 }
 
 func TestConsumer_ReplaysEventsPublishedBeforeItStarted(t *testing.T) {
@@ -399,10 +442,21 @@ func TestConsumer_ShutdownDrainsInFlightHandler(t *testing.T) {
 	// Cancel while the handler is mid-flight; it must be allowed to finish.
 	stop()
 
+	// finished must already be closed by the time stop() returns: stop()
+	// blocks until consumer.Run returns, and Run is documented to drain
+	// in-flight handlers before returning. A separate grace window here
+	// (waiting on <-finished with its own timeout after stop() has already
+	// returned) cannot tell "Run drained the handler" apart from "Run
+	// returned immediately and the handler happened to finish on its own
+	// moments later" — slowHandler's 500ms sleep is unpreemptible and
+	// ignores ctx, so it completes on the same wall-clock schedule either
+	// way. A non-blocking check is the only form of this assertion that
+	// can fail when the drain is missing.
 	select {
 	case <-finished:
-	case <-time.After(time.Second):
-		t.Error("in-flight handler did not complete before shutdown returned")
+	default:
+		t.Error("consumer.Run returned before the in-flight handler completed; " +
+			"Run must drain in-flight handlers within ShutdownTimeout before returning")
 	}
 }
 
