@@ -1,9 +1,12 @@
 package messaging
 
 import (
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"os"
 	"runtime"
 	"time"
 
@@ -23,9 +26,10 @@ type RedisConfig struct {
 	PoolSize int
 }
 
-// ConsumerConfig configures a Consumer. Its defaulting and Group-required
-// validation are added in a later phase alongside NewConsumer; the struct
-// exists now so Config compiles as documented in PRD §17.
+// ConsumerConfig configures a Consumer. Its defaults and validation are
+// applied by validateConsumer, which NewConsumer calls after Validate.
+// MaxDeliveryAttempts is defaulted here but is not enforced until the
+// delivery-attempt cap lands in Phase 2b.
 type ConsumerConfig struct {
 	Group               string
 	ConsumerName        string
@@ -68,6 +72,14 @@ type Config struct {
 
 const defaultPoolSizeMultiplier = 10
 
+const (
+	defaultConcurrency         = 1
+	defaultClaimInterval       = 30 * time.Second
+	defaultClaimMinIdle        = 60 * time.Second
+	defaultMaxDeliveryAttempts = 5
+	defaultShutdownTimeout     = 30 * time.Second
+)
+
 // Validate checks required fields and fills in defaults for everything
 // else. Called by NewPublisher; a later consumer phase adds an additional
 // Consumer.Group check in NewConsumer.
@@ -105,4 +117,71 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// validateConsumer checks the consumer-only fields and fills in their
+// defaults. It is called by NewConsumer after Validate.
+//
+// These checks live outside Validate because publisher-only applications
+// never set Consumer fields, and requiring a consumer group from them would
+// be wrong.
+func (c *Config) validateConsumer() error {
+	if c.Consumer.Group == "" {
+		return fmt.Errorf("config: Consumer.Group is required for consumers")
+	}
+	if c.Consumer.Concurrency < 0 {
+		return fmt.Errorf("config: Consumer.Concurrency must not be negative, got %d", c.Consumer.Concurrency)
+	}
+
+	if c.Consumer.Concurrency == 0 {
+		c.Consumer.Concurrency = defaultConcurrency
+	}
+	if c.Consumer.ClaimInterval == 0 {
+		c.Consumer.ClaimInterval = defaultClaimInterval
+	}
+	if c.Consumer.ClaimMinIdle == 0 {
+		c.Consumer.ClaimMinIdle = defaultClaimMinIdle
+	}
+	if c.Consumer.MaxDeliveryAttempts == 0 {
+		c.Consumer.MaxDeliveryAttempts = defaultMaxDeliveryAttempts
+	}
+	if c.Consumer.ShutdownTimeout == 0 {
+		c.Consumer.ShutdownTimeout = defaultShutdownTimeout
+	}
+
+	// Reclaiming sooner than the sweep interval would let a message be
+	// claimed while its previous delivery is still legitimately in flight.
+	if c.Consumer.ClaimMinIdle < c.Consumer.ClaimInterval {
+		return fmt.Errorf(
+			"config: Consumer.ClaimMinIdle (%v) must be >= Consumer.ClaimInterval (%v)",
+			c.Consumer.ClaimMinIdle, c.Consumer.ClaimInterval,
+		)
+	}
+
+	if c.Consumer.ConsumerName == "" {
+		name, err := defaultConsumerName()
+		if err != nil {
+			return err
+		}
+		c.Consumer.ConsumerName = name
+	}
+
+	return nil
+}
+
+// defaultConsumerName builds a name that identifies the host but stays
+// unique across replicas and restarts on that host, so two processes never
+// share a Redis consumer identity.
+func defaultConsumerName() (string, error) {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+
+	suffix := make([]byte, 3)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", fmt.Errorf("generating consumer name suffix: %w", err)
+	}
+
+	return host + "-" + hex.EncodeToString(suffix), nil
 }
