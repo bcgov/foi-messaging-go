@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	wm "github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill-redisstream/pkg/redisstream"
 	"github.com/ThreeDotsLabs/watermill/message"
 
@@ -55,6 +56,7 @@ type SubscriberOptions struct {
 	ClaimInterval time.Duration
 	ClaimMinIdle  time.Duration
 	BlockTime     time.Duration
+	Logger        wm.LoggerAdapter
 }
 
 // Subscriber implements watermill's message.Subscriber over Redis Streams,
@@ -65,6 +67,7 @@ type Subscriber struct {
 	claimInterval time.Duration
 	claimMinIdle  time.Duration
 	blockTime     time.Duration
+	logger        wm.LoggerAdapter
 
 	sem       chan struct{}
 	closing   chan struct{}
@@ -83,20 +86,30 @@ func NewSubscriber(opts SubscriberOptions) (*Subscriber, error) {
 	if opts.BlockTime <= 0 {
 		opts.BlockTime = defaultBlockTime
 	}
+	if opts.Logger == nil {
+		opts.Logger = &wm.NopLogger{}
+	}
 
 	return &Subscriber{
 		reader:        opts.Reader,
 		claimInterval: opts.ClaimInterval,
 		claimMinIdle:  opts.ClaimMinIdle,
 		blockTime:     opts.BlockTime,
+		logger:        opts.Logger,
 		sem:           make(chan struct{}, opts.Concurrency),
 		closing:       make(chan struct{}),
 	}, nil
 }
 
 // Subscribe consumes stream — the full Redis stream name, not the logical
-// topic. The returned channel is closed when the subscriber is closed or ctx
-// is cancelled.
+// topic. Cancelling ctx stops the read loop and closes the returned channel,
+// but only Close guarantees full teardown: it is what releases any in-flight
+// message's ack-wait goroutine and its concurrency slot. Callers must always
+// call Close, even after cancelling ctx.
+//
+// The ack-wait deliberately does not observe ctx: a message that completes
+// during a graceful drain (ctx already cancelled, Close not yet called) must
+// still be acked rather than left to be redelivered.
 func (s *Subscriber) Subscribe(ctx context.Context, stream string) (<-chan *message.Message, error) {
 	if err := s.reader.EnsureGroup(ctx, stream); err != nil {
 		return nil, fmt.Errorf("ensuring consumer group on %q: %w", stream, err)
@@ -182,7 +195,12 @@ func (s *Subscriber) emit(ctx context.Context, stream string, out chan<- *messag
 			// shutdown in progress still records completed work.
 			ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
-			_ = s.reader.Ack(ackCtx, stream, e.ID)
+			if err := s.reader.Ack(ackCtx, stream, e.ID); err != nil {
+				s.logger.Error("failed to ack stream entry", err, wm.LogFields{
+					"stream":   stream,
+					"entry_id": e.ID,
+				})
+			}
 		case <-msg.Nacked():
 			// Leave the entry pending; the claim loop redelivers it.
 		case <-s.closing:

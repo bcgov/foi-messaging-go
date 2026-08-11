@@ -21,8 +21,6 @@ type fakeReader struct {
 
 	acked []string
 	reads int
-	//nolint:unused // reserved for Task 3's claim-loop conformance tests
-	readGate chan struct{} // if non-nil, ReadNew blocks on it after draining
 }
 
 func newFakeReader(entries ...internalredis.Entry) *fakeReader {
