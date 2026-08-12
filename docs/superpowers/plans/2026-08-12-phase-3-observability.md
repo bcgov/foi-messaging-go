@@ -21,6 +21,7 @@
 - Metric instrument names use dots (`messaging.events.published`); the Prometheus exporter translates them. Never rename an instrument without updating the naming test in Task 12.
 - `event_type` is a metric attribute **only** on a typed registry match. Spans may always carry it.
 - Verify with `go test -tags=integration -race -count=1 ./...` before claiming green. `make test` alone proves nothing about the consume path.
+- **Task 6 has a mandatory human verification gate before its commit.** It rewrites `dispatch`'s control flow, where a reordered check passes every test in this plan while silently changing when an event is dead-lettered versus nacked. Stop and hand back rather than committing.
 
 ---
 
@@ -1687,7 +1688,33 @@ Expected: PASS, all seven subtests plus the cardinality test.
 Run: `go test -race ./...`
 Expected: PASS. `dispatch`'s existing tests assert behaviour this task deliberately did not change; a failure means the refactor altered a return or a log line.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Run the integration suite**
+
+Run: `go test -tags=integration -race -count=1 ./...`
+Expected: PASS. Phase 2b's cap, DLQ, and retry tests are the ones that would catch a reordered check; they only run under this tag.
+
+- [ ] **STOP — Step 9: Manual verification gate**
+
+**Do not commit. Stop here and hand back to the human.**
+
+This is the only task that rewrites the control flow of the most subtle function in the repository, and the failure mode is silent: a reordered check still passes every telemetry test in this plan while changing when an event is dead-lettered versus nacked. Tests alone are not sufficient evidence here.
+
+Produce this for review and wait for an explicit go-ahead:
+
+```bash
+git diff consumer.go
+```
+
+State, in the handoff, the answers to each of these — do not merely assert "behaviour is unchanged":
+
+1. **Check order.** The delivery-attempt cap still fires *before* `json.Unmarshal`. Quote the two lines in order from the new code. An over-cap event must not spend handler invocations, or its concurrency slot, proving what its counter already said.
+2. **Dead-letter vs nack.** All three deserialization failures (undecodable, invalid envelope, unparseable version) still `return c.deadLetter(...)` rather than returning a bare error. Nacking them instead would burn five reclaim cycles to reach a verdict available on the first look.
+3. **Return values.** Every exit path returns what it returned before: `nil` for no-handler and discard, the handler's error for retries-exhausted, `deadLetter`'s result for the four DLQ paths.
+4. **Log lines.** Every existing `log.Warn` / `log.Error` / `log.Debug` call survives with its original message string and attributes. Phase 2b's integration tests assert on some of these.
+5. **The lock.** The `c.mu.Lock()` / `Unlock()` around `registry.lookup` still spans only the lookup, and no telemetry call was added inside it.
+6. **Test edits.** Confirm you changed **no** existing test assertion. If a Phase 2b test failed and you altered it, say so explicitly — that is a signal the refactor changed behaviour, not that the test was wrong.
+
+If the human approves, commit:
 
 ```bash
 git add consumer.go consumer_test.go
