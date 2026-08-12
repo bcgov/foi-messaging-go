@@ -352,3 +352,29 @@ PRD §14 fixes three `reason` values. The pipeline's failure points map onto the
   §5 above picks one; the PRD should record it.
 - **README already documents the `AsX` and `DeadLetter` signatures as planned.**
   Keep them or update the README in the same commit.
+
+### Found during implementation
+
+- **Retry silently invalidates 2a's reclaim test.**
+  `TestConsumer_RedeliversNackedEventViaReclaim` proves the
+  `XPENDING RetryCount + 1` arithmetic the cap compares against, by observing
+  the delivery attempt stamped on a handler-error log. Immediate retry breaks
+  it twice over: a delivery is now `1+MaxImmediateRetries` invocations, so a
+  handler failing twice never reaches the reclaim path at all, and the log line
+  it observes moved into `runWithRetry` under a new message. `failFirst` must
+  cover two whole deliveries (8 at the defaults) and the message constant must
+  follow the code. Left uncorrected the test passes while asserting nothing —
+  the worst available outcome for the one test that pins the counter Layer 3
+  depends on.
+- **`Consumer.Run`'s `OnUndecodable` closure had no coverage.** §5's seam is
+  tested against a fake reader inside `internal/watermill`, which exercises the
+  hook but not the wiring: the stream-to-topic lookup, the marshalling of the
+  raw fields into `event_raw`, and the detached, timeout-bounded DLQ context
+  are all in the root package and all only reachable end to end. §8's
+  "undecodable entry written directly to the stream" item is what covers them;
+  it needs a `testsupport` XADD helper, since no publisher of ours can write an
+  entry the marshaller rejects.
+- **A poison-backlog test must wait on the DLQ count, not the pending count.**
+  `XPENDING` reports `NOGROUP` until `Run` has created the group, and reports 0
+  both before the first delivery and after the drain — so polling it alone
+  passes instantly against a consumer that never started.

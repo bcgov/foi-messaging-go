@@ -8,7 +8,7 @@ Standardized asynchronous messaging for FOI platform services — a transport-ag
 
 ## Why this exists
 
-FOI services communicate asynchronously, but today each one implements serialization, routing, retries, correlation, and Redis configuration on its own. This library provides those concerns once, behind a small typed API — serialization, routing, correlation, and Redis configuration today; retry and dead-lettering in Phase 2b.
+FOI services communicate asynchronously, but today each one implements serialization, routing, retries, correlation, and Redis configuration on its own. This library provides those concerns once, behind a small typed API: serialization, routing, correlation, Redis configuration, retry, and dead-lettering.
 
 Application code interacts only with this library. Watermill, Redis Streams, and go-redis are internal implementation details and never cross the library boundary.
 
@@ -17,8 +17,8 @@ Application code interacts only with this library. Watermill, Redis Streams, and
 - Standard, strongly-typed event envelope with generic payloads
 - Publisher and consumer APIs keyed on a shared typed `EventDef` (topic + type + version)
 - Automatic serialization, routing, and handler dispatch
-- *(Planned: Phase 2b)* At-least-once delivery with three-layer retry and poison-message protection
-- *(Planned: Phase 2b)* Dead Letter Queue with a defined wrapper contract
+- At-least-once delivery with three-layer retry and poison-message protection
+- Dead Letter Queue with a defined wrapper contract
 - Correlation-ID propagation across service chains
 - *(Planned: Phase 3)* OpenTelemetry tracing and Prometheus metrics
 - Structured logging via `slog`
@@ -132,30 +132,32 @@ Routing is two-level: `EventDef.Topic` maps to a Redis stream, and within that s
 The library is **at-least-once**. Three consequences are application obligations:
 
 - **Handlers must be idempotent.** The same event may be delivered more than once; `event_id` is the deduplication key.
-- **Ordering is per-stream and only with `Concurrency: 1`** (the default). Reclaimed messages arrive out of order. `Concurrency` bounds in-flight handlers *per subscribed topic*, so a consumer registered on three topics at `Concurrency: 3` can be running nine handlers.
+- **Ordering is per-stream and only with `Concurrency: 1`** (the default). Reclaimed messages arrive out of order. `Concurrency` bounds in-flight handlers *per subscribed topic*, so a consumer registered on three topics at `Concurrency: 3` can be running nine handlers. Immediate retries run inside the message's slot, so a retrying message holds its topic's slot for the whole retry window — which is what preserves ordering at `Concurrency: 1`.
 - **Publishing is not transactional with your database.** A crash between a DB write and a publish loses the event. Transactional outbox support is on the roadmap, not in the initial release.
 
 ## Error handling
 
-A handler that returns an error NACKs the message, leaving it pending in Redis Streams. The reclaim loop redelivers the message indefinitely — there is no delivery-attempt cap and no Dead Letter Queue in Phase 2a. An unhandleable message will retry forever.
+A handler that returns an error is retried in-process — `Retry.MaxImmediateRetries` times, with exponential backoff and full jitter — before the message NACKs and is left pending for the reclaim loop. Redelivery is bounded by `Consumer.MaxDeliveryAttempts`: on the delivery whose attempt exceeds it, the event is dead-lettered and ACKed without being decoded or dispatched.
 
-> **Planned for Phase 2b** — Error classification API and delivery caps will allow handlers to mark failures as permanent (route to DLQ, then ACK) or transient (automatic retry). Unclassified errors will be treated as retryable.
-
-Error classification will work by wrapping the returned error:
+Handlers steer that path by classifying the error they return:
 
 ```go
-return messaging.AsPermanent(err) // → Dead Letter Queue, then ACK (Phase 2b)
-return messaging.AsRetryable(err) // → retried (Phase 2b)
-return messaging.AsDiscard(err)   // → acknowledged without retry (Phase 2b)
+return messaging.AsPermanent(err) // → Dead Letter Queue, then ACK
+return messaging.AsRetryable(err) // → retried in-process, then NACKed
+return messaging.AsDiscard(err)   // → acknowledged without retry or DLQ
 ```
 
-Until Phase 2b arrives, the safest pattern is for handlers to be idempotent and circuit-break on detected errors, logging them for human review.
+An unclassified error is retryable. Classification is re-read on every attempt, so a handler may fail transiently and then return `AsPermanent` once it knows better. `AsPermanent` and `AsDiscard` both skip the remaining retries; `AsPermanent` skips the delivery cap too, since the verdict is already final.
+
+Classification is additive: `errors.Is` and `errors.As` see straight through the wrapper, and a classified error may itself be wrapped with `%w` without losing its verdict.
 
 ## Dead Letter Queue
 
-> **Planned for Phase 2b — not yet implemented.**
+Permanent failures, messages exceeding the delivery cap, and events that could not be deserialized are published to `<topic>.dlq` using the exported `messaging.DeadLetter` wrapper, which carries failure metadata — `reason`, `error`, `delivery_attempts`, `consumer_group`, `consumer_name`, `original_topic`, `dead_lettered_at` — alongside the original event.
 
-Permanent failures and messages exceeding the delivery cap will be published to `<topic>.dlq` using an exported `messaging.DeadLetter` wrapper that preserves the original envelope byte-for-byte alongside failure metadata, so replay tooling can republish without transformation.
+The event travels in one of two fields, never both. `event` holds the original bytes verbatim when they were valid JSON, so replay tooling can republish without transformation; `event_raw` holds them when they were not parseable, which is the case for a malformed entry or an envelope that failed validation. Splicing unparseable bytes into `event` would make the dead letter itself invalid JSON, unreadable by the very tooling the DLQ exists for.
+
+A failed DLQ write NACKs rather than ACKs: while the DLQ is unwritable the entry stays pending and the next reclaim sweep retries it, which is preferable to acknowledging an event into nothing.
 
 ## Configuration
 
@@ -169,11 +171,11 @@ cfg := messaging.Config{
 }
 ```
 
-Redis auth/TLS, pool sizing, consumer concurrency, and claim intervals are all configurable with working defaults. Delivery caps (`MaxDeliveryAttempts`) and retry backoff settings (`RetryConfig`) are accepted and defaulted but are not yet read by any code path — they take effect in Phase 2b. See the [full configuration reference](docs/foi-messaging-go-prd-v1.1.md#17-configuration).
+Redis auth/TLS, pool sizing, consumer concurrency, and claim intervals are all configurable with working defaults, as are the delivery cap (`MaxDeliveryAttempts`, default 5) and retry backoff (`RetryConfig`, default 3 retries from 100ms to 5s). Because retries sleep inside the message's concurrency slot, `NewConsumer` rejects a config whose worst-case backoff reaches `Consumer.ClaimMinIdle` — such a config guarantees the entry is reclaimed, and processed a second time by the same process, before the first delivery has finished retrying. See the [full configuration reference](docs/foi-messaging-go-prd-v1.1.md#17-configuration).
 
 ## Observability
 
-Consumers emit structured `slog` logs when an envelope cannot be decoded, fails validation, or carries an unparseable schema version, and a debug log when no registered handler matches an event. Logged fields include `topic`, `event_id`, `event_type` (when a handler is not found), and `error`. Correlation IDs propagate through handler contexts via `context.Context`.
+Consumers emit structured `slog` logs when an envelope cannot be decoded, fails validation, or carries an unparseable schema version, a warning whenever an event is dead-lettered or discarded, and a debug log when no registered handler matches an event. Logged fields include `topic`, `event_id`, `event_type` (when a handler is not found), and `error`. Correlation IDs propagate through handler contexts via `context.Context`.
 
 > **Planned for Phase 3** — OpenTelemetry tracing with linked spans for publish and consume, and Prometheus metrics covering event counts (published/received/processed/failed), retries, and processing latency.
 

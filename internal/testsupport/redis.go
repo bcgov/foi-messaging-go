@@ -93,3 +93,19 @@ func PendingCount(ctx context.Context, addr, stream, group string) (int64, error
 	}
 	return summary.Count, nil
 }
+
+// WriteStreamEntry connects to addr and appends fields to stream verbatim
+// via XADD, bypassing the library's publisher. It exists so integration
+// tests can plant an entry the Watermill marshaller cannot read — a failure
+// mode no publisher of ours can produce, but which a foreign writer on a
+// shared stream can.
+func WriteStreamEntry(ctx context.Context, addr, stream string, fields map[string]any) (string, error) {
+	client := goredis.NewClient(&goredis.Options{Addr: addr})
+	defer func() { _ = client.Close() }()
+
+	id, err := client.XAdd(ctx, &goredis.XAddArgs{Stream: stream, Values: fields}).Result()
+	if err != nil {
+		return "", fmt.Errorf("writing entry to stream %q: %w", stream, err)
+	}
+	return id, nil
+}

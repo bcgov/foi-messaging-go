@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
 )
@@ -281,28 +283,45 @@ func TestDispatch_AcksUnmatchedMajorVersion(t *testing.T) {
 	}
 }
 
-func TestDispatch_ReturnsErrorOnUndecodableEnvelope(t *testing.T) {
+func TestDispatch_DeadLettersUndecodableEnvelope(t *testing.T) {
 	consumer, err := NewConsumer(testConsumerConfig())
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
 	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
 	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
 	}
 
-	// In Phase 2a an undecodable entry nacks rather than being dropped;
-	// Phase 2b routes it to the DLQ instead.
-	if err := consumer.dispatch(context.Background(), "documents", []byte(`not json`), nil); err == nil {
-		t.Error("expected an error for an undecodable envelope")
+	// Acked, not nacked: malformed JSON does not become valid on
+	// redelivery, so burning the cap on it only delays the same verdict.
+	if err := consumer.dispatch(context.Background(), "documents", []byte(`not json`), nil); err != nil {
+		t.Fatalf("dispatch must ack after dead-lettering, got %v", err)
+	}
+
+	got := sink.only(t)
+	if got.Reason != ReasonDeserializationFailed {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonDeserializationFailed)
+	}
+	if string(got.EventRaw) != "not json" {
+		t.Errorf("EventRaw = %q, want the original bytes preserved", got.EventRaw)
+	}
+	if got.Event != nil {
+		t.Error("unparseable bytes must not be spliced into event")
 	}
 }
 
-func TestDispatch_ReturnsErrorOnInvalidEnvelope(t *testing.T) {
+func TestDispatch_DeadLettersInvalidEnvelope(t *testing.T) {
 	consumer, err := NewConsumer(testConsumerConfig())
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
 	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
 	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
@@ -317,8 +336,21 @@ func TestDispatch_ReturnsErrorOnInvalidEnvelope(t *testing.T) {
 		"payload":{}
 	}`)
 
-	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
-		t.Error("expected an error for an envelope failing validation")
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err != nil {
+		t.Fatalf("dispatch must ack after dead-lettering, got %v", err)
+	}
+
+	got := sink.only(t)
+	if got.Reason != ReasonDeserializationFailed {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonDeserializationFailed)
+	}
+	// PRD §14 puts an envelope failing validation in event_raw too: it did
+	// not deserialize into a usable event, whatever its syntax.
+	if got.Event != nil {
+		t.Error("an envelope failing validation belongs in event_raw, not event")
+	}
+	if len(got.EventRaw) == 0 {
+		t.Error("the original bytes must be preserved")
 	}
 }
 
@@ -327,6 +359,9 @@ func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
 	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
 	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
@@ -337,8 +372,7 @@ func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
 	// schemaVersionPattern (^\d+\.\d+\.\d+$) rejects a signed major before
 	// majorVersion's strconv.Atoi ever sees it. If dispatch ever called
 	// majorVersion first, "-1" would parse cleanly as major -1 and this
-	// event would be routed (or silently acked) instead of nacked as an
-	// invalid envelope.
+	// event would be routed (or silently acked) instead of dead-lettered.
 	body := []byte(`{
 		"event_id":"01234567-89ab-7def-8000-000000000000",
 		"event_type":"document.created",
@@ -349,37 +383,225 @@ func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
 		"payload":{}
 	}`)
 
-	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
-		t.Error("expected an error for a negative-major schema_version: validateEnvelope must reject it before majorVersion ever runs")
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err != nil {
+		t.Fatalf("dispatch must ack after dead-lettering, got %v", err)
+	}
+
+	got := sink.only(t)
+	// The error text is how the ordering is observable now that both paths
+	// end in the same reason: validateEnvelope names schema_version,
+	// majorVersion's failure would name parsing instead.
+	if !strings.Contains(got.Error, "validating envelope") {
+		t.Errorf("Error = %q, want a validateEnvelope failure: it must reject the signed major before majorVersion runs", got.Error)
 	}
 }
 
-func TestDispatch_PropagatesHandlerError(t *testing.T) {
-	consumer, err := NewConsumer(testConsumerConfig())
+// fastRetryConfig keeps the retry loop's structure but removes the waiting.
+// Zero means "use the default" for RetryConfig, so retries cannot be
+// switched off; they can only be made instant.
+func fastRetryConfig(retries int) Config {
+	cfg := testConsumerConfig()
+	cfg.Retry = RetryConfig{
+		MaxImmediateRetries: retries,
+		InitialBackoff:      time.Nanosecond,
+		MaxBackoff:          time.Nanosecond,
+	}
+	return cfg
+}
+
+func TestDispatch_RetriesThenNacksARetryableError(t *testing.T) {
+	consumer, err := NewConsumer(fastRetryConfig(3))
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
 
+	var calls int
 	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
-	if err := RegisterHandler(consumer, def, handlerFunc(func(context.Context, Envelope[testPayload]) error {
-		return errHandlerFailed
-	})); err != nil {
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		return errBoom
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
 	}
 
-	body := []byte(`{
-		"event_id":"01234567-89ab-7def-8000-000000000000",
-		"event_type":"document.created",
-		"timestamp":"2026-04-23T10:00:00Z",
-		"schema_version":"1.0.0",
-		"correlation_id":"corr-1",
-		"source":"other.service",
-		"payload":{}
-	}`)
+	// Exhausting immediate retries nacks: the entry stays pending and the
+	// reclaim loop redelivers it with its counter advanced toward the cap.
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err == nil {
+		t.Error("expected exhausted retries to nack")
+	}
+	if calls != 4 {
+		t.Errorf("handler called %d times, want 4 (1 attempt + 3 retries)", calls)
+	}
+	if sink.count() != 0 {
+		t.Error("exhausted retries must nack, not dead-letter: the cap decides that, not the retry loop")
+	}
+}
 
-	// Phase 2a nacks on any handler error; Phase 2b classifies instead.
-	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
-		t.Error("expected the handler error to propagate so the message nacks")
+func TestDispatch_StopsRetryingOnceTheHandlerSucceeds(t *testing.T) {
+	consumer, err := NewConsumer(fastRetryConfig(3))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	consumer.dlq = &recordingSink{}
+
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		if calls < 3 {
+			return errBoom
+		}
+		return nil
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if calls != 3 {
+		t.Errorf("handler called %d times, want 3", calls)
+	}
+}
+
+func TestDispatch_PermanentErrorDeadLettersWithoutRetrying(t *testing.T) {
+	consumer, err := NewConsumer(fastRetryConfig(3))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		return AsPermanent(errBoom)
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("a dead-lettered event must ack, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("handler called %d times, want 1: a permanent error must not be retried", calls)
+	}
+	got := sink.only(t)
+	if got.Reason != ReasonPermanent {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonPermanent)
+	}
+	if string(got.Event) == "" {
+		t.Error("a decodable event belongs in event, so replay tooling can republish it")
+	}
+}
+
+func TestDispatch_DiscardErrorAcksWithoutDLQOrRetry(t *testing.T) {
+	consumer, err := NewConsumer(fastRetryConfig(3))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		return AsDiscard(errBoom)
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("a discarded event must ack, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("handler called %d times, want 1", calls)
+	}
+	if sink.count() != 0 {
+		t.Error("a discarded event must produce no dead letter")
+	}
+}
+
+func TestDispatch_ReclassifiesOnEveryAttempt(t *testing.T) {
+	// A handler may fail transiently and then discover the failure is
+	// permanent. Deciding classification once, on the first error, would
+	// keep retrying an error the handler has already given up on.
+	consumer, err := NewConsumer(fastRetryConfig(3))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		if calls == 1 {
+			return errBoom // unclassified: retryable
+		}
+		return AsPermanent(errBoom)
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("handler called %d times, want 2: the second attempt's permanent verdict must stop the loop", calls)
+	}
+	if got := sink.only(t); got.Reason != ReasonPermanent {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonPermanent)
+	}
+}
+
+func TestDispatch_CancelledContextAbandonsRetry(t *testing.T) {
+	// ctx here is the message context, which stays live through the whole
+	// drain by design. Its cancellation means the subscriber closed, so
+	// abandoning the retry to a nack is right — the entry is still pending.
+	cfg := testConsumerConfig()
+	cfg.Retry = RetryConfig{
+		MaxImmediateRetries: 3,
+		InitialBackoff:      10 * time.Second,
+		MaxBackoff:          10 * time.Second,
+	}
+	consumer, err := NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	consumer.dlq = &recordingSink{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		cancel()
+		return errBoom
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	start := time.Now()
+	if err := consumer.dispatch(ctx, "documents", validEnvelopeJSON(), nil); err == nil {
+		t.Error("expected an abandoned retry to nack")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("dispatch took %v: a cancelled context must abort the backoff, not sleep through it", elapsed)
+	}
+	if calls != 1 {
+		t.Errorf("handler called %d times, want 1", calls)
 	}
 }
 
@@ -421,7 +643,7 @@ func TestDispatch_RawHandlerReceivesEveryEventOnTopic(t *testing.T) {
 	}
 }
 
-var errHandlerFailed = errors.New("handler failed")
+var errBoom = errors.New("boom")
 
 // handlerFunc adapts a function to Handler[testPayload].
 type handlerFunc func(context.Context, Envelope[testPayload]) error
@@ -435,4 +657,232 @@ type rawHandlerFunc func(context.Context, Envelope[json.RawMessage]) error
 
 func (f rawHandlerFunc) Handle(ctx context.Context, env Envelope[json.RawMessage]) error {
 	return f(ctx, env)
+}
+
+// recordingSink captures dead letters instead of publishing them, so
+// dispatch's DLQ routing can be asserted without Redis.
+type recordingSink struct {
+	mu      sync.Mutex
+	streams []string
+	bodies  [][]byte
+	err     error
+}
+
+func (s *recordingSink) publish(_ context.Context, stream string, body []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.streams = append(s.streams, stream)
+	s.bodies = append(s.bodies, body)
+	return nil
+}
+
+func (s *recordingSink) only(t *testing.T) DeadLetter {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.bodies) != 1 {
+		t.Fatalf("expected exactly 1 dead letter, got %d", len(s.bodies))
+	}
+	var dl DeadLetter
+	if err := json.Unmarshal(s.bodies[0], &dl); err != nil {
+		t.Fatalf("unmarshalling dead letter: %v", err)
+	}
+	return dl
+}
+
+func TestDeadLetter_WritesToTheTopicsDLQStream(t *testing.T) {
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	dl := consumer.newDeadLetter("documents", ReasonPermanent, errors.New("boom"), 3)
+	dl.Event = json.RawMessage(`{"event_id":"abc"}`)
+	if err := consumer.deadLetter(context.Background(), "documents", dl); err != nil {
+		t.Fatalf("deadLetter: %v", err)
+	}
+
+	if got, want := sink.streams[0], "foi:documents.dlq"; got != want {
+		t.Errorf("stream = %q, want %q", got, want)
+	}
+	got := sink.only(t)
+	if got.Reason != ReasonPermanent {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonPermanent)
+	}
+	if got.Error != "boom" {
+		t.Errorf("Error = %q, want %q", got.Error, "boom")
+	}
+	if got.DeliveryAttempts != 3 {
+		t.Errorf("DeliveryAttempts = %d, want 3", got.DeliveryAttempts)
+	}
+	if got.OriginalTopic != "documents" {
+		t.Errorf("OriginalTopic = %q, want %q", got.OriginalTopic, "documents")
+	}
+	if got.ConsumerGroup != "test-group" {
+		t.Errorf("ConsumerGroup = %q, want %q", got.ConsumerGroup, "test-group")
+	}
+	if got.ConsumerName == "" {
+		t.Error("ConsumerName must be set so an operator can identify the instance")
+	}
+	if got.DeadLetteredAt.IsZero() {
+		t.Error("DeadLetteredAt must be set")
+	}
+}
+
+func TestDeadLetter_PublishFailureReturnsAnError(t *testing.T) {
+	// The caller nacks on a non-nil return. Acking here would drop the
+	// event with nothing anywhere holding it (PRD §14).
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	consumer.dlq = &recordingSink{err: errors.New("redis down")}
+
+	dl := consumer.newDeadLetter("documents", ReasonPermanent, errors.New("boom"), 1)
+	if err := consumer.deadLetter(context.Background(), "documents", dl); err == nil {
+		t.Error("expected a DLQ publish failure to be reported so the message nacks")
+	}
+}
+
+func TestDeadLetter_WithoutASinkReturnsAnError(t *testing.T) {
+	// Only reachable from a Consumer that was constructed but never run.
+	// Erroring nacks, which is the safe direction.
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+
+	dl := consumer.newDeadLetter("documents", ReasonPermanent, errors.New("boom"), 1)
+	if err := consumer.deadLetter(context.Background(), "documents", dl); err == nil {
+		t.Error("expected an error when no dead letter sink is configured")
+	}
+}
+
+func (s *recordingSink) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.bodies)
+}
+
+// validEnvelopeJSON is an envelope that passes validation and routes to the
+// documents/document.created/1.x.x handler.
+func validEnvelopeJSON() []byte {
+	return []byte(`{
+		"event_id":"01234567-89ab-7def-8000-000000000000",
+		"event_type":"document.created",
+		"timestamp":"2026-04-23T10:00:00Z",
+		"schema_version":"1.0.0",
+		"correlation_id":"corr-1",
+		"source":"other.service",
+		"payload":{}
+	}`)
+}
+
+func TestDeliveryAttempt_DefaultsToTheFirstDelivery(t *testing.T) {
+	// A missing or malformed counter must not dead-letter an event. The cap
+	// exists to bound redelivery, not to punish odd transport metadata.
+	tests := []struct {
+		name     string
+		metadata map[string]string
+		want     int64
+	}{
+		{"nil metadata", nil, 1},
+		{"absent key", map[string]string{}, 1},
+		{"unparseable", map[string]string{"_foi_delivery_attempt": "many"}, 1},
+		{"zero", map[string]string{"_foi_delivery_attempt": "0"}, 1},
+		{"negative", map[string]string{"_foi_delivery_attempt": "-4"}, 1},
+		{"valid", map[string]string{"_foi_delivery_attempt": "4"}, 4},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deliveryAttempt(tc.metadata); got != tc.want {
+				t.Errorf("deliveryAttempt = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDispatch_CapBoundary(t *testing.T) {
+	// PRD §13: attempts 1..MaxDeliveryAttempts dispatch, and the next one
+	// is dead-lettered. That is what makes the stated worst case of
+	// MaxDeliveryAttempts × (1+MaxImmediateRetries) = 20 invocations right.
+	tests := []struct {
+		name        string
+		attempt     string
+		wantHandler bool
+		wantDLQ     int
+	}{
+		{"at the cap still dispatches", "5", true, 0},
+		{"over the cap dead-letters", "6", false, 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			consumer, err := NewConsumer(testConsumerConfig())
+			if err != nil {
+				t.Fatalf("NewConsumer: %v", err)
+			}
+			sink := &recordingSink{}
+			consumer.dlq = sink
+
+			var called bool
+			def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+			h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+				called = true
+				return nil
+			})
+			if err := RegisterHandler(consumer, def, h); err != nil {
+				t.Fatalf("RegisterHandler: %v", err)
+			}
+
+			metadata := map[string]string{"_foi_delivery_attempt": tc.attempt}
+			if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), metadata); err != nil {
+				t.Fatalf("dispatch: %v", err)
+			}
+
+			if called != tc.wantHandler {
+				t.Errorf("handler called = %v, want %v", called, tc.wantHandler)
+			}
+			if got := sink.count(); got != tc.wantDLQ {
+				t.Errorf("dead letters = %d, want %d", got, tc.wantDLQ)
+			}
+		})
+	}
+}
+
+func TestDispatch_CapDeadLettersBeforeDecoding(t *testing.T) {
+	// The cap is checked before json.Unmarshal, so an over-cap event that
+	// is ALSO undecodable still reports max_attempts_exceeded — and, more
+	// importantly, never reaches the retry loop, where it would occupy its
+	// topic's concurrency slot for four handler invocations.
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	metadata := map[string]string{"_foi_delivery_attempt": "9"}
+	if err := consumer.dispatch(context.Background(), "documents", []byte(`not json`), metadata); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	got := sink.only(t)
+	if got.Reason != ReasonMaxAttemptsExceeded {
+		t.Errorf("Reason = %q, want %q — the cap must be checked before decoding", got.Reason, ReasonMaxAttemptsExceeded)
+	}
+	if got.DeliveryAttempts != 9 {
+		t.Errorf("DeliveryAttempts = %d, want 9", got.DeliveryAttempts)
+	}
 }
