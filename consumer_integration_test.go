@@ -4,6 +4,7 @@ package messaging_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync"
@@ -46,6 +47,14 @@ func consumeFixture(t *testing.T) messaging.Config {
 			ClaimInterval:   1 * time.Second,
 			ClaimMinIdle:    2 * time.Second,
 			ShutdownTimeout: 5 * time.Second,
+		},
+		Retry: messaging.RetryConfig{
+			MaxImmediateRetries: 3,
+			// Nanosecond backoff keeps the retry loop's structure without
+			// its waiting: these tests assert on attempt counts and
+			// outcomes, never on timing.
+			InitialBackoff: time.Nanosecond,
+			MaxBackoff:     time.Nanosecond,
 		},
 	}
 }
@@ -249,9 +258,13 @@ func TestConsumer_RedeliversNackedEventViaReclaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
-	// Fail twice: delivery 1 nacks, the reclaimed delivery 2 nacks and is
-	// therefore logged with its stamped attempt, delivery 3 succeeds.
-	handler := newCollectingHandler(2)
+	// Each delivery is 1+MaxImmediateRetries = 4 invocations, so failFirst
+	// must cover two whole deliveries for the reclaimed one to fail and be
+	// logged with its stamped attempt: invocations 1-4 nack delivery 1,
+	// 5-8 nack the reclaimed delivery 2, and invocation 9 — delivery 3 —
+	// succeeds. Anything less and delivery 1's own immediate retries
+	// succeed, so the reclaim path this test exists for never runs.
+	handler := newCollectingHandler(8)
 	if err := messaging.RegisterHandler(consumer, documentCreated, handler); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
 	}
@@ -274,8 +287,8 @@ func TestConsumer_RedeliversNackedEventViaReclaim(t *testing.T) {
 		}
 	}
 
-	if got := handler.attemptCount(); got < 3 {
-		t.Errorf("attempts = %d, want at least 3 (two failures then a reclaim)", got)
+	if got := handler.attemptCount(); got < 9 {
+		t.Errorf("attempts = %d, want at least 9 (two deliveries of four invocations, then a reclaim)", got)
 	}
 
 	// The first delivery comes from XREADGROUP and is attempt 1 by
@@ -292,9 +305,11 @@ func TestConsumer_RedeliversNackedEventViaReclaim(t *testing.T) {
 	}
 }
 
-// handlerErrorMsg is the log dispatch emits when a handler returns an
-// error, carrying the transport metadata the subscriber stamped.
-const handlerErrorMsg = "messaging: handler returned error"
+// handlerErrorMsg is the log runWithRetry emits once a delivery's immediate
+// retries are exhausted and the message is about to nack. It carries the
+// delivery attempt the subscriber stamped, which is what the cap compares
+// against.
+const handlerErrorMsg = "messaging: handler returned error, immediate retries exhausted"
 
 type logRecord struct {
 	msg   string
@@ -721,4 +736,289 @@ func TestConsumer_ShutdownGivesInFlightHandlerALiveContext(t *testing.T) {
 	// A handler that completed during the drain must have had its entry
 	// acked, not left pending for a redelivery ClaimMinIdle later.
 	waitForPendingCountZero(t, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
+}
+
+// TestConsumer_RetryStormOnOneTopicDoesNotStallAnother is the regression
+// test for per-topic concurrency. Concurrency bounds in-flight handlers per
+// subscribed topic, so one topic exhausting its single slot on retries must
+// not stop another topic from consuming.
+//
+// Under a Subscriber-wide semaphore — which is what this codebase had
+// before — topic A's retrying handler holds the only slot and topic B stops
+// entirely. This test is what would catch someone "simplifying" the
+// per-subscription semaphore back to a shared one.
+func TestConsumer_RetryStormOnOneTopicDoesNotStallAnother(t *testing.T) {
+	cfg := consumeFixture(t)
+	cfg.Consumer.Concurrency = 1
+	// Real backoff, so topic A genuinely occupies its slot for a while.
+	cfg.Retry = messaging.RetryConfig{
+		MaxImmediateRetries: 3,
+		InitialBackoff:      200 * time.Millisecond,
+		MaxBackoff:          200 * time.Millisecond,
+	}
+
+	stalling := messaging.EventDef{Topic: "stalling", Type: "document.created", Version: "1.0.0"}
+	flowing := messaging.EventDef{Topic: "flowing", Type: "document.created", Version: "1.0.0"}
+
+	consumer, err := messaging.NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	// Always fails: every delivery burns all four attempts and the full
+	// backoff, holding the stalling topic's only slot throughout.
+	stallingHandler := newCollectingHandler(1 << 30)
+	if err := messaging.RegisterHandler(consumer, stalling, stallingHandler); err != nil {
+		t.Fatalf("RegisterHandler(stalling): %v", err)
+	}
+	flowingHandler := newCollectingHandler(0)
+	if err := messaging.RegisterHandler(consumer, flowing, flowingHandler); err != nil {
+		t.Fatalf("RegisterHandler(flowing): %v", err)
+	}
+
+	publisher, err := messaging.NewPublisher(cfg)
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	ctx := context.Background()
+	const flowingCount = 5
+	for i := 0; i < flowingCount; i++ {
+		if _, err := publisher.Publish(ctx, stalling, documentCreatedPayload{}); err != nil {
+			t.Fatalf("Publish(stalling): %v", err)
+		}
+		if _, err := publisher.Publish(ctx, flowing, documentCreatedPayload{}); err != nil {
+			t.Fatalf("Publish(flowing): %v", err)
+		}
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- consumer.Run(runCtx) }()
+
+	// The flowing topic must drain on its own slot while the stalling topic
+	// is still working through its first message's retries.
+	deadline := time.After(15 * time.Second)
+	for len(flowingHandler.snapshot()) < flowingCount {
+		select {
+		case <-flowingHandler.notify:
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("flowing topic received %d/%d events: one topic's retries are stalling another",
+				len(flowingHandler.snapshot()), flowingCount)
+		}
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestConsumer_PermanentErrorReachesTheDLQStream(t *testing.T) {
+	cfg := consumeFixture(t)
+
+	consumer, err := messaging.NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	handled := make(chan struct{}, 1)
+	h := permanentlyFailingHandler{done: handled}
+	if err := messaging.RegisterHandler(consumer, documentCreated, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	publisher, err := messaging.NewPublisher(cfg)
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	ctx := context.Background()
+	published, err := publisher.Publish(ctx, documentCreated, documentCreatedPayload{})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- consumer.Run(runCtx) }()
+
+	select {
+	case <-handled:
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("handler was never called")
+	}
+
+	// Let the DLQ publish and the ack settle before tearing down.
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	entries, err := testsupport.ReadStreamEntries(ctx, cfg.Redis.Address, "foi:documents.dlq")
+	if err != nil {
+		t.Fatalf("ReadStreamEntries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("DLQ has %d entries, want 1", len(entries))
+	}
+
+	var dl messaging.DeadLetter
+	if err := json.Unmarshal([]byte(entries[0].Fields["payload"]), &dl); err != nil {
+		t.Fatalf("unmarshalling dead letter: %v", err)
+	}
+	if dl.Reason != messaging.ReasonPermanent {
+		t.Errorf("Reason = %q, want %q", dl.Reason, messaging.ReasonPermanent)
+	}
+	if dl.OriginalTopic != "documents" {
+		t.Errorf("OriginalTopic = %q, want %q", dl.OriginalTopic, "documents")
+	}
+	if dl.ConsumerGroup != cfg.Consumer.Group {
+		t.Errorf("ConsumerGroup = %q, want %q", dl.ConsumerGroup, cfg.Consumer.Group)
+	}
+
+	// The original envelope must survive byte-for-byte so replay tooling
+	// can republish it without transformation (PRD §14).
+	var env messaging.Envelope[documentCreatedPayload]
+	if err := json.Unmarshal(dl.Event, &env); err != nil {
+		t.Fatalf("dead-lettered event is not a readable envelope: %v", err)
+	}
+	if env.EventID != published.EventID {
+		t.Errorf("EventID = %q, want %q", env.EventID, published.EventID)
+	}
+
+	// And the original entry must be acked: a dead-lettered event is
+	// durably recorded elsewhere, so leaving it pending would redeliver it.
+	pending, err := testsupport.PendingCount(ctx, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
+	if err != nil {
+		t.Fatalf("PendingCount: %v", err)
+	}
+	if pending != 0 {
+		t.Errorf("pending = %d, want 0: a dead-lettered event must be acked", pending)
+	}
+}
+
+// permanentlyFailingHandler classifies its failure as permanent, so it is
+// dead-lettered on the first delivery without retry.
+type permanentlyFailingHandler struct {
+	done chan struct{}
+}
+
+func (h permanentlyFailingHandler) Handle(context.Context, messaging.Envelope[documentCreatedPayload]) error {
+	select {
+	case h.done <- struct{}{}:
+	default:
+	}
+	return messaging.AsPermanent(errDeliberate)
+}
+
+// TestConsumer_PoisonBacklogDrainsAndLiveTrafficResumes is 2a spec §10's
+// requested test. A reclaim sweep claims up to 100 entries and each occupies
+// a concurrency slot for a full claim/decode/release cycle — with retry,
+// for four handler invocations. At Concurrency 1 an accumulated poison
+// backlog therefore starves the read loop, and it is the delivery-attempt
+// cap that bounds it: once each entry is dead-lettered and acked, the
+// backlog is gone for good and live traffic moves again.
+func TestConsumer_PoisonBacklogDrainsAndLiveTrafficResumes(t *testing.T) {
+	cfg := consumeFixture(t)
+	cfg.Consumer.Concurrency = 1
+	cfg.Consumer.MaxDeliveryAttempts = 2
+	cfg.Consumer.ClaimInterval = 500 * time.Millisecond
+	cfg.Consumer.ClaimMinIdle = 500 * time.Millisecond
+
+	consumer, err := messaging.NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	// Fails every delivery: unclassified, so retryable, so it is the cap
+	// rather than classification that ends it.
+	handler := newCollectingHandler(1 << 30)
+	if err := messaging.RegisterHandler(consumer, documentCreated, handler); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	publisher, err := messaging.NewPublisher(cfg)
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	t.Cleanup(func() { _ = publisher.Close() })
+
+	ctx := context.Background()
+	const poisonCount = 20
+	for i := 0; i < poisonCount; i++ {
+		if _, err := publisher.Publish(ctx, documentCreated, documentCreatedPayload{}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- consumer.Run(runCtx) }()
+
+	// Every poison entry must end up in the DLQ and be acked, leaving the
+	// pending list empty — the state in which live traffic can flow again.
+	//
+	// The DLQ count is the condition waited on, not the pending count.
+	// Pending is 0 both before the consumer has read anything and after it
+	// has drained, so polling it alone would pass instantly against a
+	// consumer that never started: XPENDING even reports NOGROUP until Run
+	// has created the group.
+	deadline := time.After(60 * time.Second)
+	var entries []testsupport.StreamEntry
+	for {
+		var err error
+		entries, err = testsupport.ReadStreamEntries(ctx, cfg.Redis.Address, "foi:documents.dlq")
+		if err != nil {
+			t.Fatalf("ReadStreamEntries: %v", err)
+		}
+		if len(entries) >= poisonCount {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("DLQ has %d of %d entries: the cap is not draining the poison backlog",
+				len(entries), poisonCount)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if len(entries) != poisonCount {
+		t.Errorf("DLQ has %d entries, want %d", len(entries), poisonCount)
+	}
+
+	// Each dead-lettered entry must also be acked, or the backlog would
+	// keep being reclaimed and live traffic would still be starved.
+	for {
+		pending, err := testsupport.PendingCount(ctx, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
+		if err != nil {
+			t.Fatalf("PendingCount: %v", err)
+		}
+		if pending == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("%d entries still pending: a dead-lettered event must be acked", pending)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 }
