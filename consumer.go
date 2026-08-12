@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -266,6 +267,29 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 		"delivery_attempt", metadata[internalwatermill.MetadataDeliveryAttempt],
 	)
 
+	attempt := deliveryAttempt(metadata)
+	if attempt > int64(c.cfg.Consumer.MaxDeliveryAttempts) {
+		// Checked before decoding, and before any classification is
+		// consulted — PRD §13 Layer 3 caps regardless of classification.
+		//
+		// The ordering is load-bearing for throughput, not just tidiness.
+		// A capped event occupies its topic's concurrency slot for one
+		// metadata read and one DLQ publish; run through the retry loop
+		// instead it would hold that slot for (1+MaxImmediateRetries)
+		// handler invocations. At the default Concurrency of 1 a reclaim
+		// sweep of accumulated poison entries is what starves the read
+		// loop, so this bound is what keeps live traffic moving.
+		log.Warn("messaging: delivery attempt cap exceeded",
+			"topic", topic, "max_delivery_attempts", c.cfg.Consumer.MaxDeliveryAttempts)
+
+		dl := c.newDeadLetter(topic, ReasonMaxAttemptsExceeded,
+			fmt.Errorf("delivery attempt %d exceeded MaxDeliveryAttempts %d",
+				attempt, c.cfg.Consumer.MaxDeliveryAttempts),
+			attempt)
+		dl.Event, dl.EventRaw = deadLetterBody(payload)
+		return c.deadLetter(ctx, topic, dl)
+	}
+
 	var env Envelope[json.RawMessage]
 	if err := json.Unmarshal(payload, &env); err != nil {
 		log.Error("messaging: undecodable event envelope",
@@ -427,4 +451,19 @@ func (c *Consumer) deadLetter(ctx context.Context, topic string, dl DeadLetter) 
 		"topic", topic, "dlq_stream", stream, "reason", dl.Reason,
 		"delivery_attempts", dl.DeliveryAttempts, "error", dl.Error)
 	return nil
+}
+
+// deliveryAttempt reads the attempt counter the subscriber stamped on the
+// message.
+//
+// A missing, unparseable, or nonsensical value is treated as the first
+// delivery. The cap exists to bound redelivery of events that keep failing,
+// not to dead-letter an event whose transport metadata was odd — and every
+// caller of dispatch outside the router (tests, future tooling) passes nil.
+func deliveryAttempt(metadata map[string]string) int64 {
+	n, err := strconv.ParseInt(metadata[internalwatermill.MetadataDeliveryAttempt], 10, 64)
+	if err != nil || n < 1 {
+		return 1
+	}
+	return n
 }

@@ -541,3 +541,127 @@ func TestDeadLetter_WithoutASinkReturnsAnError(t *testing.T) {
 		t.Error("expected an error when no dead letter sink is configured")
 	}
 }
+
+func (s *recordingSink) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.bodies)
+}
+
+// validEnvelopeJSON is an envelope that passes validation and routes to the
+// documents/document.created/1.x.x handler.
+func validEnvelopeJSON() []byte {
+	return []byte(`{
+		"event_id":"01234567-89ab-7def-8000-000000000000",
+		"event_type":"document.created",
+		"timestamp":"2026-04-23T10:00:00Z",
+		"schema_version":"1.0.0",
+		"correlation_id":"corr-1",
+		"source":"other.service",
+		"payload":{}
+	}`)
+}
+
+func TestDeliveryAttempt_DefaultsToTheFirstDelivery(t *testing.T) {
+	// A missing or malformed counter must not dead-letter an event. The cap
+	// exists to bound redelivery, not to punish odd transport metadata.
+	tests := []struct {
+		name     string
+		metadata map[string]string
+		want     int64
+	}{
+		{"nil metadata", nil, 1},
+		{"absent key", map[string]string{}, 1},
+		{"unparseable", map[string]string{"_foi_delivery_attempt": "many"}, 1},
+		{"zero", map[string]string{"_foi_delivery_attempt": "0"}, 1},
+		{"negative", map[string]string{"_foi_delivery_attempt": "-4"}, 1},
+		{"valid", map[string]string{"_foi_delivery_attempt": "4"}, 4},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deliveryAttempt(tc.metadata); got != tc.want {
+				t.Errorf("deliveryAttempt = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDispatch_CapBoundary(t *testing.T) {
+	// PRD §13: attempts 1..MaxDeliveryAttempts dispatch, and the next one
+	// is dead-lettered. That is what makes the stated worst case of
+	// MaxDeliveryAttempts × (1+MaxImmediateRetries) = 20 invocations right.
+	tests := []struct {
+		name        string
+		attempt     string
+		wantHandler bool
+		wantDLQ     int
+	}{
+		{"at the cap still dispatches", "5", true, 0},
+		{"over the cap dead-letters", "6", false, 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			consumer, err := NewConsumer(testConsumerConfig())
+			if err != nil {
+				t.Fatalf("NewConsumer: %v", err)
+			}
+			sink := &recordingSink{}
+			consumer.dlq = sink
+
+			var called bool
+			def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+			h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+				called = true
+				return nil
+			})
+			if err := RegisterHandler(consumer, def, h); err != nil {
+				t.Fatalf("RegisterHandler: %v", err)
+			}
+
+			metadata := map[string]string{"_foi_delivery_attempt": tc.attempt}
+			if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), metadata); err != nil {
+				t.Fatalf("dispatch: %v", err)
+			}
+
+			if called != tc.wantHandler {
+				t.Errorf("handler called = %v, want %v", called, tc.wantHandler)
+			}
+			if got := sink.count(); got != tc.wantDLQ {
+				t.Errorf("dead letters = %d, want %d", got, tc.wantDLQ)
+			}
+		})
+	}
+}
+
+func TestDispatch_CapDeadLettersBeforeDecoding(t *testing.T) {
+	// The cap is checked before json.Unmarshal, so an over-cap event that
+	// is ALSO undecodable still reports max_attempts_exceeded — and, more
+	// importantly, never reaches the retry loop, where it would occupy its
+	// topic's concurrency slot for four handler invocations.
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	metadata := map[string]string{"_foi_delivery_attempt": "9"}
+	if err := consumer.dispatch(context.Background(), "documents", []byte(`not json`), metadata); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	got := sink.only(t)
+	if got.Reason != ReasonMaxAttemptsExceeded {
+		t.Errorf("Reason = %q, want %q — the cap must be checked before decoding", got.Reason, ReasonMaxAttemptsExceeded)
+	}
+	if got.DeliveryAttempts != 9 {
+		t.Errorf("DeliveryAttempts = %d, want 9", got.DeliveryAttempts)
+	}
+}
