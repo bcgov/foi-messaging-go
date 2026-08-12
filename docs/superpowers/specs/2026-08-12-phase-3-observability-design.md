@@ -209,6 +209,34 @@ instead, where an unbounded value costs nothing.
 
 `topic` and `group` are bounded by configuration and are always safe.
 
+**Raw handlers are the exception that nearly broke this rule.** `registry.lookup`
+returns a topic's raw handler for *every* event on that topic, so on a
+raw-handler topic a successful lookup says nothing about `event_type` — the
+wire value would flow straight into the metric attributes, unbounded, which is
+the precise case the rule exists to prevent. "Matched a handler" and "matched a
+known event type" are the same thing only for typed registrations.
+
+`lookup` therefore reports **how** it matched:
+
+```go
+// routeMatch says how an event matched a handler. It exists for
+// telemetry: a typed match means event_type came from a set fixed at
+// registration time and is safe as a metric attribute, while a raw match
+// means it is whatever the wire said and must not become one.
+type routeMatch int
+
+const (
+    matchNone routeMatch = iota
+    matchTyped
+    matchRaw
+)
+
+func (r *registry) lookup(topic, eventType string, major int) (dispatchFunc, routeMatch)
+```
+
+`event_type` becomes a metric attribute only on `matchTyped`. Spans continue to
+carry the wire value in every case.
+
 ---
 
 ## 3. Tracing
