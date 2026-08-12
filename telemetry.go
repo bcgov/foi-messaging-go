@@ -296,7 +296,6 @@ func (r *deliveryRecorder) retry(attempt int, err error) {
 	r.span.AddEvent("retry", trace.WithAttributes(
 		attribute.Int("messaging.foi.immediate_attempt", attempt),
 		attribute.String("error", err.Error()),
-		attribute.Bool("error.permanent", IsPermanent(err)),
 	))
 }
 
