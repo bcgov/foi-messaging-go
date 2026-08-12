@@ -1162,6 +1162,75 @@ func TestDispatch_EventTypeAttributeIsBounded(t *testing.T) {
 	}
 }
 
+func TestRunWithRetry_RecordsRetriesAsCounterAndSpanEvents(t *testing.T) {
+	// Spec §3: one span per delivery, with each immediate retry recorded as
+	// a span event rather than a child span. This asserts both halves — the
+	// counter increments once per retry, and the retries are visible as
+	// events on the single delivery span, not as separate spans.
+	mp, reader := newTestMeterProvider(t)
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+
+	c := newTestConsumerWithTelemetry(t, mp)
+	c.tracer = tp.Tracer(telemetryScope)
+	c.dlq = &recordingSink{}
+	// Keep the backoff out of the test's runtime.
+	c.cfg.Retry.InitialBackoff = time.Nanosecond
+	c.cfg.Retry.MaxBackoff = time.Nanosecond
+
+	var calls int
+	if err := c.registry.addTyped("documents", "document.created", 1,
+		func(context.Context, Envelope[json.RawMessage]) error {
+			calls++
+			if calls < 3 {
+				return errors.New("transient")
+			}
+			return nil
+		}); err != nil {
+		t.Fatalf("addTyped() = %v, want nil", err)
+	}
+
+	env := Envelope[json.RawMessage]{
+		EventID: "018f2e7a-1c6b-7c0a-9f8d-3e4a2b1c5d90", EventType: "document.created",
+		Timestamp: time.Now().UTC(), SchemaVersion: "1.0.0", CorrelationID: "c", Source: "s",
+		Payload: json.RawMessage(`{}`),
+	}
+	body, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshalling envelope: %v", err)
+	}
+
+	if err := c.dispatch(context.Background(), "documents", body, nil); err != nil {
+		t.Fatalf("dispatch() = %v, want nil", err)
+	}
+
+	m, ok := readMetrics(t, reader)["messaging.retries"]
+	if !ok {
+		t.Fatal("messaging.retries was not recorded")
+	}
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("retries data = %T, want Sum[int64]", m.Data)
+	}
+	if got := sum.DataPoints[0].Value; got != 2 {
+		t.Errorf("retries = %d, want 2", got)
+	}
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1 span per delivery regardless of retries", len(spans))
+	}
+	var retryEvents int
+	for _, e := range spans[0].Events() {
+		if e.Name == "retry" {
+			retryEvents++
+		}
+	}
+	if retryEvents != 2 {
+		t.Errorf("retry span events = %d, want 2", retryEvents)
+	}
+}
+
 // terminalCounterAttrs returns the attribute set of a terminal counter that
 // was recorded exactly once.
 //

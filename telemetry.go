@@ -279,6 +279,23 @@ func (r *deliveryRecorder) skipped(reason string) {
 	r.reason = reason
 }
 
+// retry records one immediate retry: a counter increment and a span event.
+//
+// A span event rather than a child span, deliberately. One span per delivery
+// keeps trace volume proportional to messages; a span per attempt would
+// multiply spans by up to 1+MaxImmediateRetries on exactly the failure path
+// where volume is already spiking, to answer a question the event's own
+// timestamp already answers.
+func (r *deliveryRecorder) retry(attempt int, err error) {
+	r.inst.retries.Add(context.Background(), 1, metric.WithAttributes(
+		consumeAttrs(r.topic, r.group, r.eventType)...))
+	r.span.AddEvent("retry", trace.WithAttributes(
+		attribute.Int("messaging.foi.immediate_attempt", attempt),
+		attribute.String("error", err.Error()),
+		attribute.Bool("error.permanent", IsPermanent(err)),
+	))
+}
+
 // end records the delivery. It is idempotent: it is called from a defer on
 // paths that also return early, and a second recording would double-count
 // every delivery.

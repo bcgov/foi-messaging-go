@@ -673,6 +673,7 @@ func (c *Consumer) runWithRetry(
 		}
 
 		log.Debug("messaging: retrying handler", "immediate_attempt", i+1, "error", err)
+		rec.retry(i+1, err)
 		if !sleepWithJitter(ctx, backoffUpperBound(c.cfg.Retry, i)) {
 			// Abandoned mid-backoff. Nack so the entry survives.
 			rec.failed(categoryRetryable, err)
