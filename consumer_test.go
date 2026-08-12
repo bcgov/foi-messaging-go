@@ -9,7 +9,14 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
+	internalwatermill "github.com/bcgov/foi-messaging-go/internal/watermill"
 )
 
 func testConsumerConfig() Config {
@@ -884,5 +891,187 @@ func TestDispatch_CapDeadLettersBeforeDecoding(t *testing.T) {
 	}
 	if got.DeliveryAttempts != 9 {
 		t.Errorf("DeliveryAttempts = %d, want 9", got.DeliveryAttempts)
+	}
+}
+
+// newTestConsumerWithTelemetry builds a Consumer wired to mp, reusing the
+// existing testConsumerConfig() so these tests stay in step with the rest
+// of the suite's defaults. dispatch is reachable without Run, which is
+// what makes the failure paths testable at all.
+func newTestConsumerWithTelemetry(t *testing.T, mp metric.MeterProvider) *Consumer {
+	t.Helper()
+
+	cfg := testConsumerConfig()
+	cfg.Telemetry.MeterProvider = mp
+
+	c, err := NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer() = %v, want nil", err)
+	}
+	return c
+}
+
+func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
+	// Spec §2's invariant, asserted against the real dispatch rather than
+	// the recorder in isolation: every exit path must record exactly one
+	// terminal counter and exactly one duration observation.
+	terminal := []string{
+		"messaging.events.processed",
+		"messaging.events.failed",
+		"messaging.events.skipped",
+	}
+
+	validEnvelope := func(eventType string) []byte {
+		env := Envelope[json.RawMessage]{
+			EventID:       "018f2e7a-1c6b-7c0a-9f8d-3e4a2b1c5d90",
+			EventType:     eventType,
+			Timestamp:     time.Now().UTC(),
+			SchemaVersion: "1.0.0",
+			CorrelationID: "corr-1",
+			Source:        "test",
+			Payload:       json.RawMessage(`{}`),
+		}
+		b, err := json.Marshal(env)
+		if err != nil {
+			t.Fatalf("marshalling test envelope: %v", err)
+		}
+		return b
+	}
+
+	tests := []struct {
+		name     string
+		payload  []byte
+		metadata map[string]string
+		handler  func(context.Context, Envelope[json.RawMessage]) error
+		register bool
+		want     string
+	}{
+		{
+			name:     "processed",
+			payload:  validEnvelope("document.created"),
+			handler:  func(context.Context, Envelope[json.RawMessage]) error { return nil },
+			register: true,
+			want:     "messaging.events.processed",
+		},
+		{
+			name:     "no handler",
+			payload:  validEnvelope("document.created"),
+			register: false,
+			want:     "messaging.events.skipped",
+		},
+		{
+			name:     "discard",
+			payload:  validEnvelope("document.created"),
+			handler:  func(context.Context, Envelope[json.RawMessage]) error { return AsDiscard(errors.New("nope")) },
+			register: true,
+			want:     "messaging.events.skipped",
+		},
+		{
+			name:     "permanent",
+			payload:  validEnvelope("document.created"),
+			handler:  func(context.Context, Envelope[json.RawMessage]) error { return AsPermanent(errors.New("bad")) },
+			register: true,
+			want:     "messaging.events.failed",
+		},
+		{
+			name:    "undecodable",
+			payload: []byte("{not json"),
+			want:    "messaging.events.failed",
+		},
+		{
+			name:     "cap exceeded",
+			payload:  validEnvelope("document.created"),
+			metadata: map[string]string{internalwatermill.MetadataDeliveryAttempt: "99"},
+			want:     "messaging.events.failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mp, reader := newTestMeterProvider(t)
+			c := newTestConsumerWithTelemetry(t, mp)
+			c.dlq = &recordingSink{}
+
+			if tt.register {
+				h := tt.handler
+				if err := c.registry.addTyped("documents", "document.created", 1,
+					func(ctx context.Context, env Envelope[json.RawMessage]) error { return h(ctx, env) }); err != nil {
+					t.Fatalf("addTyped() = %v, want nil", err)
+				}
+			}
+
+			_ = c.dispatch(context.Background(), "documents", tt.payload, tt.metadata)
+
+			got := readMetrics(t, reader)
+			for _, name := range terminal {
+				_, present := got[name]
+				if name == tt.want && !present {
+					t.Errorf("terminal counter %q was not recorded", name)
+				}
+				if name != tt.want && present {
+					t.Errorf("terminal counter %q was recorded; want only %q", name, tt.want)
+				}
+			}
+			if _, ok := got["messaging.processing.duration"]; !ok {
+				t.Error("processing.duration was not recorded")
+			}
+			if _, ok := got["messaging.events.received"]; !ok {
+				t.Error("messaging.events.received was not recorded")
+			}
+		})
+	}
+}
+
+func TestDispatch_EventTypeAttributeIsBounded(t *testing.T) {
+	// A raw handler takes every event on its topic, so the wire event_type
+	// must not become a metric attribute — that is the unbounded case the
+	// rule exists for. The span carries it regardless.
+	mp, reader := newTestMeterProvider(t)
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+
+	c := newTestConsumerWithTelemetry(t, mp)
+	c.tracer = tp.Tracer(telemetryScope)
+	c.dlq = &recordingSink{}
+
+	if err := c.registry.addRaw("documents", func(context.Context, Envelope[json.RawMessage]) error { return nil }); err != nil {
+		t.Fatalf("addRaw() = %v, want nil", err)
+	}
+
+	env := Envelope[json.RawMessage]{
+		EventID: "018f2e7a-1c6b-7c0a-9f8d-3e4a2b1c5d90", EventType: "attacker.controlled.value",
+		Timestamp: time.Now().UTC(), SchemaVersion: "1.0.0", CorrelationID: "c", Source: "s",
+		Payload: json.RawMessage(`{}`),
+	}
+	body, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshalling envelope: %v", err)
+	}
+
+	if err := c.dispatch(context.Background(), "documents", body, nil); err != nil {
+		t.Fatalf("dispatch() = %v, want nil", err)
+	}
+
+	m := readMetrics(t, reader)["messaging.events.processed"]
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("processed data = %T, want Sum[int64]", m.Data)
+	}
+	if _, found := sum.DataPoints[0].Attributes.Value(attribute.Key(attrEventType)); found {
+		t.Error("event_type was attached as a metric attribute on a raw-handler match")
+	}
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(spans))
+	}
+	var sawEventType bool
+	for _, a := range spans[0].Attributes() {
+		if a.Key == "messaging.foi.event_type" && a.Value.AsString() == "attacker.controlled.value" {
+			sawEventType = true
+		}
+	}
+	if !sawEventType {
+		t.Error("span did not carry the wire event_type")
 	}
 }

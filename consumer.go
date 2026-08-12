@@ -11,6 +11,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
 	internalwatermill "github.com/bcgov/foi-messaging-go/internal/watermill"
@@ -38,6 +42,13 @@ type Consumer struct {
 	dlq deadLetterSink
 
 	reader *internalredis.StreamReader
+
+	// inst and tracer are built once by NewConsumer, not by Run: dispatch
+	// is reachable without Run (tests, and the failure paths that are
+	// hardest to provoke against a live broker), and a nil instrument set
+	// there would panic rather than simply not record.
+	inst   *instruments
+	tracer trace.Tracer
 }
 
 // NewConsumer validates cfg and returns a Consumer with no handlers
@@ -51,7 +62,12 @@ func NewConsumer(cfg Config) (*Consumer, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	return &Consumer{cfg: cfg, registry: newRegistry()}, nil
+	return &Consumer{
+		cfg:      cfg,
+		registry: newRegistry(),
+		inst:     newInstruments(cfg.Telemetry.MeterProvider, cfg.Telemetry.Logger),
+		tracer:   cfg.Telemetry.TracerProvider.Tracer(telemetryScope),
+	}, nil
 }
 
 // RegisterHandler registers a typed handler for def. It is a function
@@ -315,13 +331,48 @@ func (c *Consumer) closeReader(reader *internalredis.StreamReader) error {
 // slot — proving what its counter already said; then the three
 // deserialization failures dead-letter rather than nack, being permanent by
 // definition; then runWithRetry runs the handler.
+//
+// Telemetry is stated, not recorded, on each of the seven terminal exit
+// paths: every path calls one rec.processed/failed/skipped and the single
+// deferred rec.end() below turns that into the span status, the duration
+// observation, and exactly one terminal counter. Instrumenting each path in
+// place would thread twenty-odd statements through the subtlest function in
+// the repository and make every exit path added later a chance to forget
+// one.
 func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, metadata map[string]string) error {
+	// Extracted before the span opens so the consumer span parents to the
+	// producer's (PRD §5). A message with no traceparent simply starts a
+	// new trace here.
+	ctx = c.cfg.Telemetry.Propagator.Extract(ctx, propagation.MapCarrier(metadata))
+
+	stream := c.streamName(topic)
+	ctx, span := c.tracer.Start(ctx, "process "+topic,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "redis"),
+			attribute.String("messaging.operation.name", "process"),
+			attribute.String("messaging.destination.name", stream),
+			attribute.String("messaging.consumer.group.name", c.cfg.Consumer.Group),
+			attribute.String("messaging.foi.stream_id", metadata[internalwatermill.MetadataStreamID]),
+		))
+
+	rec := newDeliveryRecorder(c.inst, span, topic, c.cfg.Consumer.Group, c.cfg.Telemetry.Logger)
+	// The only thing guaranteeing the span is closed when a handler is
+	// abandoned at the drain deadline: message contexts are
+	// context.WithoutCancel-derived and stay live for the whole
+	// ShutdownTimeout, so nothing else will end it.
+	defer rec.end()
+
+	c.inst.received.Add(ctx, 1, metric.WithAttributes(attribute.String(attrTopic, topic)))
+
 	log := c.cfg.Telemetry.Logger.With(
 		"stream_id", metadata[internalwatermill.MetadataStreamID],
 		"delivery_attempt", metadata[internalwatermill.MetadataDeliveryAttempt],
 	)
 
 	attempt := deliveryAttempt(metadata)
+	span.SetAttributes(attribute.Int64("messaging.foi.delivery_attempt", attempt))
+
 	if attempt > int64(c.cfg.Consumer.MaxDeliveryAttempts) {
 		// Checked before decoding, and before any classification is
 		// consulted — PRD §13 Layer 3 caps regardless of classification.
@@ -336,10 +387,11 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 		log.Warn("messaging: delivery attempt cap exceeded",
 			"topic", topic, "max_delivery_attempts", c.cfg.Consumer.MaxDeliveryAttempts)
 
-		dl := c.newDeadLetter(topic, ReasonMaxAttemptsExceeded,
-			fmt.Errorf("delivery attempt %d exceeded MaxDeliveryAttempts %d",
-				attempt, c.cfg.Consumer.MaxDeliveryAttempts),
-			attempt)
+		err := fmt.Errorf("delivery attempt %d exceeded MaxDeliveryAttempts %d",
+			attempt, c.cfg.Consumer.MaxDeliveryAttempts)
+		rec.failed(categoryMaxAttempts, err)
+
+		dl := c.newDeadLetter(topic, ReasonMaxAttemptsExceeded, err, attempt)
 		dl.Event, dl.EventRaw = deadLetterBody(payload)
 		return c.deadLetter(ctx, topic, dl)
 	}
@@ -359,15 +411,30 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 		// PRD §14 puts everything that failed to deserialize into a usable
 		// event in event_raw, including a syntactically valid envelope
 		// that failed validation.
+		rec.failed(categoryDeserialization, err)
+
 		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
 			fmt.Errorf("unmarshalling envelope on topic %q: %w", topic, err), attempt)
 		dl.EventRaw = payload
 		return c.deadLetter(ctx, topic, dl)
 	}
 
+	// Set on the span, never on the metric attributes at this point: the
+	// event type here is whatever the wire said, and only a typed registry
+	// match downstream proves it came from a bounded set. Spans are not
+	// aggregated by attribute value, so they carry it unconditionally.
+	span.SetAttributes(
+		attribute.String("messaging.message.id", env.EventID),
+		attribute.String("messaging.foi.event_type", env.EventType),
+		attribute.String("messaging.foi.schema_version", env.SchemaVersion),
+		attribute.String("messaging.foi.correlation_id", env.CorrelationID),
+	)
+
 	if err := validateEnvelope(env); err != nil {
 		log.Error("messaging: invalid event envelope",
 			"topic", topic, "event_id", env.EventID, "error", err)
+		rec.failed(categoryDeserialization, err)
+
 		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
 			fmt.Errorf("validating envelope on topic %q: %w", topic, err), attempt)
 		dl.EventRaw = payload
@@ -378,6 +445,8 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	if err != nil {
 		log.Error("messaging: unparseable schema version",
 			"topic", topic, "event_id", env.EventID, "error", err)
+		rec.failed(categoryDeserialization, err)
+
 		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
 			fmt.Errorf("parsing schema version on topic %q: %w", topic, err), attempt)
 		dl.EventRaw = payload
@@ -391,15 +460,22 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	if match == matchNone {
 		// Topics are shared and services consume only the event types they
 		// care about, so an unmatched event is a normal outcome, not a
-		// failure. Phase 3 counts these as skipped{reason="no_handler"}.
+		// failure. It counts as skipped{reason="no_handler"}.
 		log.Debug("messaging: no handler for event",
 			"topic", topic, "event_type", env.EventType,
 			"schema_version", env.SchemaVersion, "event_id", env.EventID)
+		rec.skipped(reasonNoHandler)
 		return nil
 	}
 
+	// Only a typed match proves the event type came from a bounded set
+	// fixed at registration; a raw handler takes whatever the wire said.
+	if match == matchTyped {
+		rec.setEventType(env.EventType)
+	}
+
 	ctx = contextWithCorrelationID(ctx, env.CorrelationID)
-	return c.runWithRetry(ctx, topic, payload, attempt, handler, env)
+	return c.runWithRetry(ctx, topic, payload, attempt, handler, env, rec)
 }
 
 // streamName maps a logical topic to its Redis stream.
@@ -542,6 +618,10 @@ func deliveryAttempt(metadata map[string]string) int64 {
 // sleep would let a later message overtake the retrying one, and per-topic
 // ordering at Concurrency 1 is a documented guarantee (PRD §6). The bound
 // being per topic is what keeps the stall from reaching other topics.
+//
+// rec is dispatch's recorder rather than one of this loop's own: the whole
+// loop is one delivery, so its three terminal branches state the outcome
+// for the delivery dispatch already opened a span and started a timer for.
 func (c *Consumer) runWithRetry(
 	ctx context.Context,
 	topic string,
@@ -549,6 +629,7 @@ func (c *Consumer) runWithRetry(
 	attempt int64,
 	handler dispatchFunc,
 	env Envelope[json.RawMessage],
+	rec *deliveryRecorder,
 ) error {
 	log := c.cfg.Telemetry.Logger.With(
 		"topic", topic, "event_type", env.EventType,
@@ -565,14 +646,17 @@ func (c *Consumer) runWithRetry(
 		// the one that should apply.
 		switch {
 		case err == nil:
+			rec.processed()
 			return nil
 
 		case IsDiscard(err):
 			log.Warn("messaging: handler discarded event", "error", err)
+			rec.skipped(reasonDiscard)
 			return nil
 
 		case IsPermanent(err):
 			log.Error("messaging: handler returned a permanent error", "error", err)
+			rec.failed(categoryPermanent, err)
 			dl := c.newDeadLetter(topic, ReasonPermanent, err, attempt)
 			dl.Event, dl.EventRaw = deadLetterBody(payload)
 			return c.deadLetter(ctx, topic, dl)
@@ -584,12 +668,14 @@ func (c *Consumer) runWithRetry(
 			// redelivers it with its counter advanced.
 			log.Error("messaging: handler returned error, immediate retries exhausted",
 				"immediate_attempts", i+1, "error", err)
+			rec.failed(categoryRetryable, err)
 			return err
 		}
 
 		log.Debug("messaging: retrying handler", "immediate_attempt", i+1, "error", err)
 		if !sleepWithJitter(ctx, backoffUpperBound(c.cfg.Retry, i)) {
 			// Abandoned mid-backoff. Nack so the entry survives.
+			rec.failed(categoryRetryable, err)
 			return err
 		}
 	}
