@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"time"
@@ -256,11 +257,15 @@ func (c *Consumer) closeReader(reader *internalredis.StreamReader) error {
 // metadata carries the transport-only fields the subscriber stamped on the
 // message — the Redis entry ID and the delivery attempt. They are logged,
 // never merged into the envelope: PRD §5 keeps transport state out of the
-// event contract. Phase 2b reads the delivery attempt here for the cap.
+// event contract. The delivery attempt is read here for the cap.
 //
 // Returning nil acks the message; returning an error nacks it, leaving the
-// entry pending for redelivery. In this phase every failure nacks — error
-// classification, the delivery cap, and the DLQ arrive in Phase 2b.
+// entry pending for redelivery. The order of the checks below is
+// load-bearing: the delivery-attempt cap fires before decoding, so an
+// over-cap event never spends handler invocations — or its concurrency
+// slot — proving what its counter already said; then the three
+// deserialization failures dead-letter rather than nack, being permanent by
+// definition; then runWithRetry runs the handler.
 func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, metadata map[string]string) error {
 	log := c.cfg.Telemetry.Logger.With(
 		"stream_id", metadata[internalwatermill.MetadataStreamID],
@@ -345,17 +350,7 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	}
 
 	ctx = contextWithCorrelationID(ctx, env.CorrelationID)
-	if err := handler(ctx, env); err != nil {
-		// Logged here so a handler failure reaches the same slog.Logger
-		// as the other three nack paths above, rather than only
-		// watermill's own "Handler returned error".
-		log.Error("messaging: handler returned error",
-			"topic", topic, "event_type", env.EventType,
-			"schema_version", env.SchemaVersion, "event_id", env.EventID,
-			"error", err)
-		return err
-	}
-	return nil
+	return c.runWithRetry(ctx, topic, payload, attempt, handler, env)
 }
 
 // streamName maps a logical topic to its Redis stream.
@@ -486,4 +481,89 @@ func deliveryAttempt(metadata map[string]string) int64 {
 		return 1
 	}
 	return n
+}
+
+// runWithRetry is PRD §13 Layer 1: immediate in-process retry with full
+// jitter, ending in an ack, a dead letter, or a nack.
+//
+// Every attempt runs inside the message's per-topic concurrency slot, which
+// is held for the whole loop. At the default Concurrency of 1 that means a
+// retrying message blocks its topic's read loop until the loop finishes.
+// That is deliberate rather than overlooked: releasing the slot across the
+// sleep would let a later message overtake the retrying one, and per-topic
+// ordering at Concurrency 1 is a documented guarantee (PRD §6). The bound
+// being per topic is what keeps the stall from reaching other topics.
+func (c *Consumer) runWithRetry(
+	ctx context.Context,
+	topic string,
+	payload []byte,
+	attempt int64,
+	handler dispatchFunc,
+	env Envelope[json.RawMessage],
+) error {
+	log := c.cfg.Telemetry.Logger.With(
+		"topic", topic, "event_type", env.EventType,
+		"schema_version", env.SchemaVersion, "event_id", env.EventID,
+		"delivery_attempt", attempt,
+	)
+
+	for i := 0; ; i++ {
+		err := handler(ctx, env)
+
+		// Classification is re-read on every attempt rather than decided
+		// once from the first error: a handler may fail transiently and
+		// then discover the failure is permanent, and the latest verdict is
+		// the one that should apply.
+		switch {
+		case err == nil:
+			return nil
+
+		case IsDiscard(err):
+			log.Warn("messaging: handler discarded event", "error", err)
+			return nil
+
+		case IsPermanent(err):
+			log.Error("messaging: handler returned a permanent error", "error", err)
+			dl := c.newDeadLetter(topic, ReasonPermanent, err, attempt)
+			dl.Event, dl.EventRaw = deadLetterBody(payload)
+			return c.deadLetter(ctx, topic, dl)
+
+		case i >= c.cfg.Retry.MaxImmediateRetries:
+			// Nack, not a dead letter. The cap decides when to give up on
+			// an event; this loop only decides when to stop trying within
+			// one delivery. The entry stays pending and the reclaim loop
+			// redelivers it with its counter advanced.
+			log.Error("messaging: handler returned error, immediate retries exhausted",
+				"immediate_attempts", i+1, "error", err)
+			return err
+		}
+
+		log.Debug("messaging: retrying handler", "immediate_attempt", i+1, "error", err)
+		if !sleepWithJitter(ctx, backoffUpperBound(c.cfg.Retry, i)) {
+			// Abandoned mid-backoff. Nack so the entry survives.
+			return err
+		}
+	}
+}
+
+// sleepWithJitter sleeps a random duration in [0, upper) — PRD §13's full
+// jitter — reporting false if ctx was cancelled first.
+//
+// A cancellation here is not the shutdown drain: message contexts are
+// derived from context.WithoutCancel and stay live for the whole
+// ShutdownTimeout, so ctx is Done only once the subscriber has closed.
+// Retries are therefore never interrupted by a graceful shutdown, which is
+// why ShutdownTimeout has to be budgeted with the retry multiplier in mind.
+func sleepWithJitter(ctx context.Context, upper time.Duration) bool {
+	if upper <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(time.Duration(rand.Int64N(int64(upper))))
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }

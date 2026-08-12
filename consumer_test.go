@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
 )
@@ -395,32 +396,212 @@ func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
 	}
 }
 
-func TestDispatch_PropagatesHandlerError(t *testing.T) {
-	consumer, err := NewConsumer(testConsumerConfig())
+// fastRetryConfig keeps the retry loop's structure but removes the waiting.
+// Zero means "use the default" for RetryConfig, so retries cannot be
+// switched off; they can only be made instant.
+func fastRetryConfig(retries int) Config {
+	cfg := testConsumerConfig()
+	cfg.Retry = RetryConfig{
+		MaxImmediateRetries: retries,
+		InitialBackoff:      time.Nanosecond,
+		MaxBackoff:          time.Nanosecond,
+	}
+	return cfg
+}
+
+func TestDispatch_RetriesThenNacksARetryableError(t *testing.T) {
+	consumer, err := NewConsumer(fastRetryConfig(3))
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
 
+	var calls int
 	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
-	if err := RegisterHandler(consumer, def, handlerFunc(func(context.Context, Envelope[testPayload]) error {
-		return errHandlerFailed
-	})); err != nil {
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		return errBoom
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
 	}
 
-	body := []byte(`{
-		"event_id":"01234567-89ab-7def-8000-000000000000",
-		"event_type":"document.created",
-		"timestamp":"2026-04-23T10:00:00Z",
-		"schema_version":"1.0.0",
-		"correlation_id":"corr-1",
-		"source":"other.service",
-		"payload":{}
-	}`)
+	// Exhausting immediate retries nacks: the entry stays pending and the
+	// reclaim loop redelivers it with its counter advanced toward the cap.
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err == nil {
+		t.Error("expected exhausted retries to nack")
+	}
+	if calls != 4 {
+		t.Errorf("handler called %d times, want 4 (1 attempt + 3 retries)", calls)
+	}
+	if sink.count() != 0 {
+		t.Error("exhausted retries must nack, not dead-letter: the cap decides that, not the retry loop")
+	}
+}
 
-	// Phase 2a nacks on any handler error; Phase 2b classifies instead.
-	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
-		t.Error("expected the handler error to propagate so the message nacks")
+func TestDispatch_StopsRetryingOnceTheHandlerSucceeds(t *testing.T) {
+	consumer, err := NewConsumer(fastRetryConfig(3))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	consumer.dlq = &recordingSink{}
+
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		if calls < 3 {
+			return errBoom
+		}
+		return nil
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if calls != 3 {
+		t.Errorf("handler called %d times, want 3", calls)
+	}
+}
+
+func TestDispatch_PermanentErrorDeadLettersWithoutRetrying(t *testing.T) {
+	consumer, err := NewConsumer(fastRetryConfig(3))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		return AsPermanent(errBoom)
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("a dead-lettered event must ack, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("handler called %d times, want 1: a permanent error must not be retried", calls)
+	}
+	got := sink.only(t)
+	if got.Reason != ReasonPermanent {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonPermanent)
+	}
+	if string(got.Event) == "" {
+		t.Error("a decodable event belongs in event, so replay tooling can republish it")
+	}
+}
+
+func TestDispatch_DiscardErrorAcksWithoutDLQOrRetry(t *testing.T) {
+	consumer, err := NewConsumer(fastRetryConfig(3))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		return AsDiscard(errBoom)
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("a discarded event must ack, got %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("handler called %d times, want 1", calls)
+	}
+	if sink.count() != 0 {
+		t.Error("a discarded event must produce no dead letter")
+	}
+}
+
+func TestDispatch_ReclassifiesOnEveryAttempt(t *testing.T) {
+	// A handler may fail transiently and then discover the failure is
+	// permanent. Deciding classification once, on the first error, would
+	// keep retrying an error the handler has already given up on.
+	consumer, err := NewConsumer(fastRetryConfig(3))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		if calls == 1 {
+			return errBoom // unclassified: retryable
+		}
+		return AsPermanent(errBoom)
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	if err := consumer.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("handler called %d times, want 2: the second attempt's permanent verdict must stop the loop", calls)
+	}
+	if got := sink.only(t); got.Reason != ReasonPermanent {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonPermanent)
+	}
+}
+
+func TestDispatch_CancelledContextAbandonsRetry(t *testing.T) {
+	// ctx here is the message context, which stays live through the whole
+	// drain by design. Its cancellation means the subscriber closed, so
+	// abandoning the retry to a nack is right — the entry is still pending.
+	cfg := testConsumerConfig()
+	cfg.Retry = RetryConfig{
+		MaxImmediateRetries: 3,
+		InitialBackoff:      10 * time.Second,
+		MaxBackoff:          10 * time.Second,
+	}
+	consumer, err := NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	consumer.dlq = &recordingSink{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	h := handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		calls++
+		cancel()
+		return errBoom
+	})
+	if err := RegisterHandler(consumer, def, h); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	start := time.Now()
+	if err := consumer.dispatch(ctx, "documents", validEnvelopeJSON(), nil); err == nil {
+		t.Error("expected an abandoned retry to nack")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("dispatch took %v: a cancelled context must abort the backoff, not sleep through it", elapsed)
+	}
+	if calls != 1 {
+		t.Errorf("handler called %d times, want 1", calls)
 	}
 }
 
@@ -462,7 +643,7 @@ func TestDispatch_RawHandlerReceivesEveryEventOnTopic(t *testing.T) {
 	}
 }
 
-var errHandlerFailed = errors.New("handler failed")
+var errBoom = errors.New("boom")
 
 // handlerFunc adapts a function to Handler[testPayload].
 type handlerFunc func(context.Context, Envelope[testPayload]) error
