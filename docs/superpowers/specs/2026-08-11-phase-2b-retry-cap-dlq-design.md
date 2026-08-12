@@ -279,10 +279,22 @@ else in the pipeline. Left nil, the subscriber keeps 2a behaviour, which is what
 seam. A DLQ publisher built that way inside a running consumer would open a
 second connection pool.
 
-Phase 2b adds an unexported `newPublisherWithClient(cfg, client)` that `Run`
-uses to build the DLQ publisher over the client it already has.
-`NewPublisher` becomes a thin wrapper over it, so there is one construction path
-rather than two.
+**Corrected during planning.** An earlier draft of this section proposed an
+unexported `newPublisherWithClient(cfg, client)` so `Run` could build a
+`messaging.Publisher` over its existing client. That is the wrong type. A
+`messaging.Publisher` wraps whatever it is given in an `Envelope`, but a DLQ
+entry *is* a `DeadLetter` document, not an envelope containing one — routing
+through `Publisher.Publish` would double-wrap it and break the contract in §7.
+
+`Run` instead builds an `internalwatermill.NewPublisher(client)` directly, which
+already accepts a client, and marshals the `DeadLetter` itself. `NewPublisher`
+and `messaging.Publisher` are untouched by this phase.
+
+One consequence to hold: `internalwatermill.Publisher.Close` closes the client
+it was built over, and this one shares `Run`'s client with the reader. The DLQ
+publisher must therefore never be `Close`d — `closeReader` owns that client, and
+a second `Close` returns `ErrClosed` from go-redis's pool, which would surface
+as a spurious teardown failure from `Run`.
 
 ## 7. Reason mapping
 
