@@ -250,3 +250,120 @@ func TestValidate_LeavesConsumerFieldsAloneForPublishers(t *testing.T) {
 		t.Errorf("Consumer.Concurrency = %d, want 0 — Validate must not default consumer fields", cfg.Consumer.Concurrency)
 	}
 }
+
+func TestBackoffUpperBound_DoublesThenCaps(t *testing.T) {
+	r := RetryConfig{
+		MaxImmediateRetries: 6,
+		InitialBackoff:      100 * time.Millisecond,
+		MaxBackoff:          500 * time.Millisecond,
+	}
+
+	want := []time.Duration{
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+		500 * time.Millisecond, // capped
+		500 * time.Millisecond,
+		500 * time.Millisecond,
+	}
+	for i, w := range want {
+		if got := backoffUpperBound(r, i); got != w {
+			t.Errorf("backoffUpperBound(%d) = %v, want %v", i, got, w)
+		}
+	}
+}
+
+func TestWorstCaseBackoff_SumsTheDefaults(t *testing.T) {
+	// The library defaults: 100ms + 200ms + 400ms across three retries.
+	r := RetryConfig{
+		MaxImmediateRetries: 3,
+		InitialBackoff:      100 * time.Millisecond,
+		MaxBackoff:          5 * time.Second,
+	}
+	if got, want := worstCaseBackoff(r), 700*time.Millisecond; got != want {
+		t.Errorf("worstCaseBackoff = %v, want %v", got, want)
+	}
+}
+
+func TestWorstCaseBackoff_ZeroRetriesIsZero(t *testing.T) {
+	r := RetryConfig{MaxImmediateRetries: 0, InitialBackoff: time.Second, MaxBackoff: time.Minute}
+	if got := worstCaseBackoff(r); got != 0 {
+		t.Errorf("worstCaseBackoff = %v, want 0", got)
+	}
+}
+
+func TestValidateConsumer_RejectsBackoffReachingClaimMinIdle(t *testing.T) {
+	// 10 retries capped at 30s is ~150s of backoff against a 60s
+	// ClaimMinIdle: the entry is reclaimed and processed a second time by
+	// this same process before the first delivery has finished sleeping.
+	cfg := Config{
+		Source: "test.service",
+		Redis:  RedisConfig{Address: "localhost:6379"},
+		Consumer: ConsumerConfig{
+			Group:        "test-group",
+			ClaimMinIdle: 60 * time.Second,
+		},
+		Retry: RetryConfig{
+			MaxImmediateRetries: 10,
+			InitialBackoff:      time.Second,
+			MaxBackoff:          30 * time.Second,
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	err := cfg.validateConsumer()
+	if err == nil {
+		t.Fatal("expected worst-case backoff exceeding ClaimMinIdle to be rejected")
+	}
+	if !strings.Contains(err.Error(), "ClaimMinIdle") {
+		t.Errorf("error should name ClaimMinIdle, got %q", err)
+	}
+}
+
+func TestValidateConsumer_AcceptsDefaultBackoffAgainstDefaultClaimMinIdle(t *testing.T) {
+	cfg := Config{
+		Source:   "test.service",
+		Redis:    RedisConfig{Address: "localhost:6379"},
+		Consumer: ConsumerConfig{Group: "test-group"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if err := cfg.validateConsumer(); err != nil {
+		t.Fatalf("the library's own defaults must validate: %v", err)
+	}
+}
+
+func TestValidate_RejectsNegativeRetryFields(t *testing.T) {
+	// Zero means "use the default" for every field in this config, so a
+	// negative value would otherwise sail past defaulting into the backoff
+	// arithmetic.
+	tests := []struct {
+		name  string
+		retry RetryConfig
+		field string
+	}{
+		{"retries", RetryConfig{MaxImmediateRetries: -1}, "MaxImmediateRetries"},
+		{"initial", RetryConfig{InitialBackoff: -time.Second}, "InitialBackoff"},
+		{"max", RetryConfig{MaxBackoff: -time.Second}, "MaxBackoff"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				Source: "test.service",
+				Redis:  RedisConfig{Address: "localhost:6379"},
+				Retry:  tc.retry,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected a negative %s to be rejected", tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("error should name %s, got %q", tc.field, err)
+			}
+		})
+	}
+}

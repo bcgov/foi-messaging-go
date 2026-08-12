@@ -28,8 +28,6 @@ type RedisConfig struct {
 
 // ConsumerConfig configures a Consumer. Its defaults and validation are
 // applied by validateConsumer, which NewConsumer calls after Validate.
-// MaxDeliveryAttempts is defaulted here but is not enforced until the
-// delivery-attempt cap lands in Phase 2b.
 type ConsumerConfig struct {
 	// Group is the Redis consumer group name. Required.
 	Group string
@@ -53,26 +51,63 @@ type ConsumerConfig struct {
 
 	// ClaimMinIdle is how long an entry must sit unacknowledged before
 	// another consumer may reclaim it. It must be >= ClaimInterval, and it
-	// must also exceed the longest a handler is expected to run: at
-	// Concurrency > 1 a handler still running after ClaimMinIdle has its
-	// own message reclaimed and processed concurrently by this same
-	// process. Defaults to 60s.
+	// must also exceed the longest one delivery can occupy its concurrency
+	// slot — which, with immediate retry, is
+	//
+	//	(1 + Retry.MaxImmediateRetries) × handler duration + worst-case backoff
+	//
+	// not one handler run. A 20s handler at the defaults occupies its slot
+	// for up to 80.7s, so the 60s default is already too short for it: the
+	// entry is reclaimed and processed concurrently by this same process
+	// while the first delivery is still retrying.
+	//
+	// The backoff term alone is checked at construction; the handler term
+	// cannot be. Defaults to 60s.
 	ClaimMinIdle time.Duration
 
-	// MaxDeliveryAttempts is defaulted to 5 but is inert until Phase 2b.
+	// MaxDeliveryAttempts bounds redeliveries. On the delivery whose
+	// attempt exceeds it, the event is dead-lettered and acked before it is
+	// even decoded — regardless of how its failures were classified
+	// (PRD §13 Layer 3). Attempts 1..MaxDeliveryAttempts dispatch;
+	// attempt MaxDeliveryAttempts+1 is dead-lettered. Defaults to 5.
 	MaxDeliveryAttempts int
 
 	// ShutdownTimeout bounds the drain of in-flight handlers after the Run
-	// context is cancelled. Defaults to 30s.
+	// context is cancelled.
+	//
+	// Immediate retry extends the drain: a message that fails on the last
+	// attempt before shutdown can still spend
+	// Retry.MaxImmediateRetries × handler duration + worst-case backoff
+	// finishing, across Concurrency × (number of subscribed topics)
+	// messages. Retries are deliberately not interrupted by shutdown —
+	// message contexts stay live for the whole drain — so budget for it
+	// here. Defaults to 30s.
 	ShutdownTimeout time.Duration
 }
 
 // RetryConfig configures the in-process immediate-retry layer (PRD §13
-// Layer 1).
+// Layer 1): the retries a handler gets within one delivery, before the
+// message is nacked and left for the reclaim loop.
+//
+// Zero values mean "use the default" — 3 retries, 100ms initial, 5s max —
+// so there is no way to express "no retries" by zeroing MaxImmediateRetries.
+// Set InitialBackoff and MaxBackoff to a nanosecond in tests that need the
+// loop to run without waiting.
+//
+// Retries sleep inside the handler's concurrency slot, so these values
+// interact with Consumer.ClaimMinIdle; see its documentation.
 type RetryConfig struct {
+	// MaxImmediateRetries is the number of retries after the first
+	// attempt, so a message gets 1+MaxImmediateRetries invocations per
+	// delivery. Defaults to 3.
 	MaxImmediateRetries int
-	InitialBackoff      time.Duration
-	MaxBackoff          time.Duration
+
+	// InitialBackoff is the upper bound of the first retry's jittered
+	// sleep, doubling per retry. Defaults to 100ms.
+	InitialBackoff time.Duration
+
+	// MaxBackoff caps that doubling. Defaults to 5s.
+	MaxBackoff time.Duration
 }
 
 // TelemetryConfig configures observability integration. Logger is defaulted
@@ -125,6 +160,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Redis.PoolSize == 0 {
 		c.Redis.PoolSize = defaultPoolSizeMultiplier * runtime.GOMAXPROCS(0)
+	}
+	// Zero means "use the default" for all three, so a negative value would
+	// otherwise skip defaulting entirely and feed the backoff arithmetic a
+	// nonsense bound.
+	if c.Retry.MaxImmediateRetries < 0 {
+		return fmt.Errorf("config: Retry.MaxImmediateRetries must not be negative, got %d", c.Retry.MaxImmediateRetries)
+	}
+	if c.Retry.InitialBackoff < 0 {
+		return fmt.Errorf("config: Retry.InitialBackoff must not be negative, got %v", c.Retry.InitialBackoff)
+	}
+	if c.Retry.MaxBackoff < 0 {
+		return fmt.Errorf("config: Retry.MaxBackoff must not be negative, got %v", c.Retry.MaxBackoff)
 	}
 	if c.Retry.MaxImmediateRetries == 0 {
 		c.Retry.MaxImmediateRetries = 3
@@ -203,6 +250,21 @@ func (c *Config) validateConsumer() error {
 		)
 	}
 
+	// Layer 1 retry sleeps inside the handler goroutine, which holds the
+	// message's per-topic concurrency slot for the whole loop. Backoff
+	// therefore counts against ClaimMinIdle exactly as handler runtime
+	// does. A config whose backoff alone reaches ClaimMinIdle guarantees
+	// the entry is reclaimed — and processed a second time by this very
+	// process — before the first delivery has finished sleeping, with zero
+	// handler runtime needed to trigger it.
+	if wc := worstCaseBackoff(c.Retry); wc >= c.Consumer.ClaimMinIdle {
+		return fmt.Errorf(
+			"config: worst-case retry backoff (%v) must be < Consumer.ClaimMinIdle (%v); "+
+				"lower Retry.MaxImmediateRetries or Retry.MaxBackoff, or raise Consumer.ClaimMinIdle",
+			wc, c.Consumer.ClaimMinIdle,
+		)
+	}
+
 	if c.Consumer.ConsumerName == "" {
 		name, err := defaultConsumerName()
 		if err != nil {
@@ -229,4 +291,39 @@ func defaultConsumerName() (string, error) {
 	}
 
 	return host + "-" + hex.EncodeToString(suffix), nil
+}
+
+// backoffUpperBound returns the upper bound of retry i's jittered sleep:
+// InitialBackoff doubled per retry, capped at MaxBackoff (PRD §13 Layer 1).
+// i is zero-based, so retry 0 is the sleep before the second attempt.
+//
+// The retry loop jitters within this bound rather than sleeping it exactly;
+// worstCaseBackoff sums it. Both callers go through here so the number
+// config validation guards is the number the loop can actually spend.
+func backoffUpperBound(r RetryConfig, i int) time.Duration {
+	d := r.InitialBackoff
+	for range i {
+		if d >= r.MaxBackoff {
+			return r.MaxBackoff
+		}
+		d *= 2
+	}
+	if d > r.MaxBackoff {
+		return r.MaxBackoff
+	}
+	return d
+}
+
+// worstCaseBackoff is the total time the retry loop can spend sleeping
+// across all immediate retries, taking every jittered sleep at its bound.
+//
+// It exists because it is the only part of the ClaimMinIdle invariant that
+// is computable at construction: handler duration, the other term, is not
+// knowable until the handler runs.
+func worstCaseBackoff(r RetryConfig) time.Duration {
+	var total time.Duration
+	for i := range r.MaxImmediateRetries {
+		total += backoffUpperBound(r, i)
+	}
+	return total
 }
