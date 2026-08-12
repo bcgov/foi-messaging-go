@@ -294,20 +294,40 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	if err := json.Unmarshal(payload, &env); err != nil {
 		log.Error("messaging: undecodable event envelope",
 			"topic", topic, "error", err)
-		return fmt.Errorf("unmarshalling envelope on topic %q: %w", topic, err)
+		// Dead-lettered rather than nacked. These three failures are
+		// definitionally permanent — malformed JSON does not become valid
+		// on redelivery, and a missing event_id does not appear — so
+		// routing them through the cap would spend five reclaim cycles,
+		// each holding a concurrency slot, to reach a verdict that was
+		// available on the first look.
+		//
+		// EventRaw is set directly rather than through deadLetterBody:
+		// PRD §14 puts everything that failed to deserialize into a usable
+		// event in event_raw, including a syntactically valid envelope
+		// that failed validation.
+		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
+			fmt.Errorf("unmarshalling envelope on topic %q: %w", topic, err), attempt)
+		dl.EventRaw = payload
+		return c.deadLetter(ctx, topic, dl)
 	}
 
 	if err := validateEnvelope(env); err != nil {
 		log.Error("messaging: invalid event envelope",
 			"topic", topic, "event_id", env.EventID, "error", err)
-		return fmt.Errorf("validating envelope on topic %q: %w", topic, err)
+		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
+			fmt.Errorf("validating envelope on topic %q: %w", topic, err), attempt)
+		dl.EventRaw = payload
+		return c.deadLetter(ctx, topic, dl)
 	}
 
 	major, err := majorVersion(env.SchemaVersion)
 	if err != nil {
 		log.Error("messaging: unparseable schema version",
 			"topic", topic, "event_id", env.EventID, "error", err)
-		return fmt.Errorf("parsing schema version on topic %q: %w", topic, err)
+		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
+			fmt.Errorf("parsing schema version on topic %q: %w", topic, err), attempt)
+		dl.EventRaw = payload
+		return c.deadLetter(ctx, topic, dl)
 	}
 
 	c.mu.Lock()

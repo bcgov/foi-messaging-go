@@ -282,28 +282,45 @@ func TestDispatch_AcksUnmatchedMajorVersion(t *testing.T) {
 	}
 }
 
-func TestDispatch_ReturnsErrorOnUndecodableEnvelope(t *testing.T) {
+func TestDispatch_DeadLettersUndecodableEnvelope(t *testing.T) {
 	consumer, err := NewConsumer(testConsumerConfig())
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
 	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
 	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
 	}
 
-	// In Phase 2a an undecodable entry nacks rather than being dropped;
-	// Phase 2b routes it to the DLQ instead.
-	if err := consumer.dispatch(context.Background(), "documents", []byte(`not json`), nil); err == nil {
-		t.Error("expected an error for an undecodable envelope")
+	// Acked, not nacked: malformed JSON does not become valid on
+	// redelivery, so burning the cap on it only delays the same verdict.
+	if err := consumer.dispatch(context.Background(), "documents", []byte(`not json`), nil); err != nil {
+		t.Fatalf("dispatch must ack after dead-lettering, got %v", err)
+	}
+
+	got := sink.only(t)
+	if got.Reason != ReasonDeserializationFailed {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonDeserializationFailed)
+	}
+	if string(got.EventRaw) != "not json" {
+		t.Errorf("EventRaw = %q, want the original bytes preserved", got.EventRaw)
+	}
+	if got.Event != nil {
+		t.Error("unparseable bytes must not be spliced into event")
 	}
 }
 
-func TestDispatch_ReturnsErrorOnInvalidEnvelope(t *testing.T) {
+func TestDispatch_DeadLettersInvalidEnvelope(t *testing.T) {
 	consumer, err := NewConsumer(testConsumerConfig())
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
 	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
 	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
@@ -318,8 +335,21 @@ func TestDispatch_ReturnsErrorOnInvalidEnvelope(t *testing.T) {
 		"payload":{}
 	}`)
 
-	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
-		t.Error("expected an error for an envelope failing validation")
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err != nil {
+		t.Fatalf("dispatch must ack after dead-lettering, got %v", err)
+	}
+
+	got := sink.only(t)
+	if got.Reason != ReasonDeserializationFailed {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonDeserializationFailed)
+	}
+	// PRD §14 puts an envelope failing validation in event_raw too: it did
+	// not deserialize into a usable event, whatever its syntax.
+	if got.Event != nil {
+		t.Error("an envelope failing validation belongs in event_raw, not event")
+	}
+	if len(got.EventRaw) == 0 {
+		t.Error("the original bytes must be preserved")
 	}
 }
 
@@ -328,6 +358,9 @@ func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
 	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
 	if err := RegisterHandler(consumer, def, noopHandler{}); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
@@ -338,8 +371,7 @@ func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
 	// schemaVersionPattern (^\d+\.\d+\.\d+$) rejects a signed major before
 	// majorVersion's strconv.Atoi ever sees it. If dispatch ever called
 	// majorVersion first, "-1" would parse cleanly as major -1 and this
-	// event would be routed (or silently acked) instead of nacked as an
-	// invalid envelope.
+	// event would be routed (or silently acked) instead of dead-lettered.
 	body := []byte(`{
 		"event_id":"01234567-89ab-7def-8000-000000000000",
 		"event_type":"document.created",
@@ -350,8 +382,16 @@ func TestDispatch_ValidatesEnvelopeBeforeParsingMajorVersion(t *testing.T) {
 		"payload":{}
 	}`)
 
-	if err := consumer.dispatch(context.Background(), "documents", body, nil); err == nil {
-		t.Error("expected an error for a negative-major schema_version: validateEnvelope must reject it before majorVersion ever runs")
+	if err := consumer.dispatch(context.Background(), "documents", body, nil); err != nil {
+		t.Fatalf("dispatch must ack after dead-lettering, got %v", err)
+	}
+
+	got := sink.only(t)
+	// The error text is how the ordering is observable now that both paths
+	// end in the same reason: validateEnvelope names schema_version,
+	// majorVersion's failure would name parsing instead.
+	if !strings.Contains(got.Error, "validating envelope") {
+		t.Errorf("Error = %q, want a validateEnvelope failure: it must reject the signed major before majorVersion runs", got.Error)
 	}
 }
 
