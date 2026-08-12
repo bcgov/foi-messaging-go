@@ -2,10 +2,13 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -226,4 +229,50 @@ func TestConsumeAttrs_Contract(t *testing.T) {
 	if extraAttrs[3].Key != "retry_count" {
 		t.Errorf("extra attr 1: got key %q, want retry_count", extraAttrs[3].Key)
 	}
+}
+
+func TestNewInstruments_ErroringProviderFallsBackToNoop(t *testing.T) {
+	// When a metric.MeterProvider fails to create instruments — whether due
+	// to a broken SDK or misconfiguration — newInstruments must detect that
+	// failure and rebuild from the no-op provider. A regression that let the
+	// error bubble out would mean a broken metrics pipeline stops a service
+	// delivering messages, which is precisely what the design forbids.
+
+	// Construct a provider that fails when building the first instrument.
+	// Embed noop.MeterProvider and override Meter to return a failing meter.
+	failingProvider := &failingMeterProvider{
+		MeterProvider: noop.NewMeterProvider(),
+	}
+
+	// newInstruments should detect the failure and rebuild from no-op.
+	inst := newInstruments(failingProvider, slog.Default())
+
+	if inst == nil {
+		t.Fatal("newInstruments with erroring provider = nil, want non-nil no-op instruments")
+	}
+
+	// Recording through the rebuilt instruments must not panic.
+	ctx := context.Background()
+	inst.published.Add(ctx, 1)
+	inst.publishFailures.Add(ctx, 1)
+	inst.processingDuration.Record(ctx, 0.1)
+	inst.queueLatency.Record(ctx, 0.1)
+}
+
+// failingMeterProvider embeds noop.MeterProvider and returns a failing meter.
+type failingMeterProvider struct {
+	otelmetric.MeterProvider
+}
+
+func (fp *failingMeterProvider) Meter(name string, opts ...otelmetric.MeterOption) otelmetric.Meter {
+	return &failingMeter{}
+}
+
+// failingMeter embeds noop.Meter and overrides Int64Counter to fail.
+type failingMeter struct {
+	noop.Meter
+}
+
+func (fm *failingMeter) Int64Counter(name string, opts ...otelmetric.Int64CounterOption) (otelmetric.Int64Counter, error) {
+	return nil, errors.New("simulated instrument creation failure")
 }
