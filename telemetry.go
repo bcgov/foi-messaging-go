@@ -37,6 +37,32 @@ const (
 	stageTransport  = "transport"
 )
 
+// metadataPublishedAt is the transport metadata key carrying wall-clock
+// publish time (PRD §5). It is unexported because PRD §5 states there is no
+// public API for transport metadata: applications neither read nor write it.
+const metadataPublishedAt = "published_at"
+
+func publishedAtNow() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+// parsePublishedAt reads the publish timestamp back.
+//
+// ok is false for a missing or unparseable value, and the caller skips the
+// queue-latency observation rather than failing. A message whose transport
+// metadata is odd is still a message worth delivering.
+func parsePublishedAt(metadata map[string]string) (time.Time, bool) {
+	raw, ok := metadata[metadataPublishedAt]
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // Skip reasons and error categories, fixed by PRD §16 and spec §2.
 const (
 	reasonNoHandler = "no_handler"
