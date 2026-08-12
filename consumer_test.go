@@ -921,21 +921,26 @@ func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
 		"messaging.events.skipped",
 	}
 
-	validEnvelope := func(eventType string) []byte {
+	envelopeWith := func(mut func(*Envelope[json.RawMessage])) []byte {
 		env := Envelope[json.RawMessage]{
 			EventID:       "018f2e7a-1c6b-7c0a-9f8d-3e4a2b1c5d90",
-			EventType:     eventType,
+			EventType:     "document.created",
 			Timestamp:     time.Now().UTC(),
 			SchemaVersion: "1.0.0",
 			CorrelationID: "corr-1",
 			Source:        "test",
 			Payload:       json.RawMessage(`{}`),
 		}
+		mut(&env)
 		b, err := json.Marshal(env)
 		if err != nil {
 			t.Fatalf("marshalling test envelope: %v", err)
 		}
 		return b
+	}
+
+	validEnvelope := func(eventType string) []byte {
+		return envelopeWith(func(e *Envelope[json.RawMessage]) { e.EventType = eventType })
 	}
 
 	tests := []struct {
@@ -945,6 +950,21 @@ func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
 		handler  func(context.Context, Envelope[json.RawMessage]) error
 		register bool
 		want     string
+
+		// wantLabel and wantLabelValue pin the series, not merely the
+		// counter. error_category and reason are the dimensions
+		// operators cut alerts on, so a terminal counter firing with
+		// the wrong label value is a silent, high-consequence defect —
+		// and asserting only on the counter name cannot see it.
+		wantLabel      string
+		wantLabelValue string
+
+		// wantEventType is the value the terminal series must carry on
+		// event_type, or "" when it must carry none. Both halves of the
+		// cardinality rule are asserted here: a typed match attaches it
+		// (dashboards are cut by it), and every other path must not
+		// (the wire value is attacker-influenced and unbounded).
+		wantEventType string
 	}{
 		{
 			name:     "processed",
@@ -952,37 +972,80 @@ func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
 			handler:  func(context.Context, Envelope[json.RawMessage]) error { return nil },
 			register: true,
 			want:     "messaging.events.processed",
+			// The positive half of the cardinality rule. Without this
+			// the setEventType call in dispatch can be deleted outright
+			// and nothing fails, while every consume dashboard silently
+			// loses its event_type dimension.
+			wantEventType: "document.created",
 		},
 		{
-			name:     "no handler",
-			payload:  validEnvelope("document.created"),
-			register: false,
-			want:     "messaging.events.skipped",
+			name:           "no handler",
+			payload:        validEnvelope("document.created"),
+			register:       false,
+			want:           "messaging.events.skipped",
+			wantLabel:      attrReason,
+			wantLabelValue: reasonNoHandler,
 		},
 		{
-			name:     "discard",
-			payload:  validEnvelope("document.created"),
-			handler:  func(context.Context, Envelope[json.RawMessage]) error { return AsDiscard(errors.New("nope")) },
-			register: true,
-			want:     "messaging.events.skipped",
+			name:           "discard",
+			payload:        validEnvelope("document.created"),
+			handler:        func(context.Context, Envelope[json.RawMessage]) error { return AsDiscard(errors.New("nope")) },
+			register:       true,
+			want:           "messaging.events.skipped",
+			wantLabel:      attrReason,
+			wantLabelValue: reasonDiscard,
+			// A skip is not attributed by event type even on a typed
+			// match: deliveryRecorder.end drops it from the skipped
+			// series deliberately.
+			wantEventType: "",
 		},
 		{
-			name:     "permanent",
-			payload:  validEnvelope("document.created"),
-			handler:  func(context.Context, Envelope[json.RawMessage]) error { return AsPermanent(errors.New("bad")) },
-			register: true,
-			want:     "messaging.events.failed",
+			name:           "permanent",
+			payload:        validEnvelope("document.created"),
+			handler:        func(context.Context, Envelope[json.RawMessage]) error { return AsPermanent(errors.New("bad")) },
+			register:       true,
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryPermanent,
+			wantEventType:  "document.created",
 		},
 		{
-			name:    "undecodable",
-			payload: []byte("{not json"),
-			want:    "messaging.events.failed",
+			name:           "undecodable",
+			payload:        []byte("{not json"),
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryDeserialization,
 		},
 		{
-			name:     "cap exceeded",
-			payload:  validEnvelope("document.created"),
-			metadata: map[string]string{internalwatermill.MetadataDeliveryAttempt: "99"},
-			want:     "messaging.events.failed",
+			// event_type with a single segment fails validateEnvelope's
+			// eventTypePattern, which is the second of the three
+			// deserialization exits and had no telemetry test at all.
+			name:           "invalid envelope",
+			payload:        envelopeWith(func(e *Envelope[json.RawMessage]) { e.EventType = "invalid" }),
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryDeserialization,
+		},
+		{
+			// The third deserialization exit, and the only way to reach
+			// it: validateEnvelope's schemaVersionPattern (^\d+\.\d+\.\d+$)
+			// rejects anything non-numeric before majorVersion is
+			// called, so "abc" would fail one check earlier. A major
+			// that is all digits but overflows int is the case that
+			// passes the pattern and still fails strconv.Atoi.
+			name:           "unparseable schema version",
+			payload:        envelopeWith(func(e *Envelope[json.RawMessage]) { e.SchemaVersion = "99999999999999999999.0.0" }),
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryDeserialization,
+		},
+		{
+			name:           "cap exceeded",
+			payload:        validEnvelope("document.created"),
+			metadata:       map[string]string{internalwatermill.MetadataDeliveryAttempt: "99"},
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryMaxAttempts,
 		},
 	}
 
@@ -1017,6 +1080,29 @@ func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
 			}
 			if _, ok := got["messaging.events.received"]; !ok {
 				t.Error("messaging.events.received was not recorded")
+			}
+
+			attrs := terminalCounterAttrs(t, got[tt.want])
+
+			if tt.wantLabel != "" {
+				v, found := attrs.Value(attribute.Key(tt.wantLabel))
+				if !found {
+					t.Errorf("%s carried no %s attribute; want %q",
+						tt.want, tt.wantLabel, tt.wantLabelValue)
+				} else if v.AsString() != tt.wantLabelValue {
+					t.Errorf("%s = %q, want %q", tt.wantLabel, v.AsString(), tt.wantLabelValue)
+				}
+			}
+
+			v, found := attrs.Value(attribute.Key(attrEventType))
+			switch {
+			case tt.wantEventType == "" && found:
+				t.Errorf("%s carried event_type=%q; the wire value is unbounded and must not be a metric attribute here",
+					tt.want, v.AsString())
+			case tt.wantEventType != "" && !found:
+				t.Errorf("%s carried no event_type attribute; want %q", tt.want, tt.wantEventType)
+			case tt.wantEventType != "" && v.AsString() != tt.wantEventType:
+				t.Errorf("event_type = %q, want %q", v.AsString(), tt.wantEventType)
 			}
 		})
 	}
@@ -1074,4 +1160,24 @@ func TestDispatch_EventTypeAttributeIsBounded(t *testing.T) {
 	if !sawEventType {
 		t.Error("span did not carry the wire event_type")
 	}
+}
+
+// terminalCounterAttrs returns the attribute set of a terminal counter that
+// was recorded exactly once.
+//
+// Insisting on a single data point is part of the assertion, not just
+// convenience: two data points on one delivery would mean two different
+// attribute sets were recorded, which is the same defect as two counters
+// firing and would otherwise hide behind an index of [0].
+func terminalCounterAttrs(t *testing.T, m metricdata.Metrics) attribute.Set {
+	t.Helper()
+
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("%s data = %T, want Sum[int64]", m.Name, m.Data)
+	}
+	if len(sum.DataPoints) != 1 {
+		t.Fatalf("%s has %d data points, want 1", m.Name, len(sum.DataPoints))
+	}
+	return sum.DataPoints[0].Attributes
 }
