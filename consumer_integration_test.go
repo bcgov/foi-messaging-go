@@ -3,10 +3,12 @@
 package messaging_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1016,6 +1018,95 @@ func TestConsumer_PoisonBacklogDrainsAndLiveTrafficResumes(t *testing.T) {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+// TestConsumer_UndecodableStreamEntryReachesTheDLQ covers the one poison
+// case the delivery-attempt cap cannot bound: an entry whose fields
+// Watermill's marshaller rejects never becomes a message, so it never
+// reaches dispatch, where both the cap and the DLQ live. Before the
+// OnUndecodable hook it re-looped every ClaimMinIdle forever.
+//
+// The subscriber's own tests cover the hook against a fake reader; this
+// covers Run's wiring of it — the stream-to-topic lookup, the marshalling
+// of the raw fields, and the detached DLQ context.
+func TestConsumer_UndecodableStreamEntryReachesTheDLQ(t *testing.T) {
+	cfg := consumeFixture(t)
+	ctx := context.Background()
+
+	consumer, err := messaging.NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	handler := newCollectingHandler(0)
+	if err := messaging.RegisterHandler(consumer, documentCreated, handler); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+
+	// Written straight to the stream: no publisher of ours can produce an
+	// entry the marshaller rejects, but a foreign writer on a shared stream
+	// can, and the library must not wedge on it.
+	entryID, err := testsupport.WriteStreamEntry(ctx, cfg.Redis.Address, "foi:documents",
+		map[string]any{"garbage": "value"})
+	if err != nil {
+		t.Fatalf("WriteStreamEntry: %v", err)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- consumer.Run(runCtx) }()
+
+	deadline := time.After(30 * time.Second)
+	var entries []testsupport.StreamEntry
+	for {
+		entries, err = testsupport.ReadStreamEntries(ctx, cfg.Redis.Address, "foi:documents.dlq")
+		if err != nil {
+			t.Fatalf("ReadStreamEntries: %v", err)
+		}
+		if len(entries) > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("an entry the marshaller cannot read never reached the DLQ")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	var dl messaging.DeadLetter
+	if err := json.Unmarshal([]byte(entries[0].Fields["payload"]), &dl); err != nil {
+		t.Fatalf("unmarshalling dead letter: %v", err)
+	}
+	if dl.Reason != messaging.ReasonDeserializationFailed {
+		t.Errorf("Reason = %q, want %q", dl.Reason, messaging.ReasonDeserializationFailed)
+	}
+	// Run's hook resolves the Redis stream name back to the logical topic.
+	if dl.OriginalTopic != "documents" {
+		t.Errorf("OriginalTopic = %q, want %q — the stream-to-topic lookup is wrong", dl.OriginalTopic, "documents")
+	}
+	if !strings.Contains(dl.Error, entryID) {
+		t.Errorf("Error = %q, want it to name the entry id %q", dl.Error, entryID)
+	}
+	// The original bytes are unreachable at this point, so the raw Redis
+	// fields are what gets preserved.
+	if !bytes.Contains(dl.EventRaw, []byte("garbage")) {
+		t.Errorf("EventRaw = %s, want the raw stream fields preserved", dl.EventRaw)
+	}
+	if dl.Event != nil {
+		t.Error("a marshaller-level failure has no parseable event; event must stay empty")
+	}
+
+	// And acked, or it would be reclaimed forever — the exact loop the hook
+	// exists to break.
+	waitForPendingCountZero(t, cfg.Redis.Address, "foi:documents", cfg.Consumer.Group)
 
 	cancel()
 	if err := <-done; err != nil {
