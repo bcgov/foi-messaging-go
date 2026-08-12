@@ -48,8 +48,12 @@ Three layers, deliberately separated so the dependency boundary is enforceable:
   Imports go-redis, never Watermill.
 - **`internal/watermill`** — `Publisher`, `Subscriber` (our own `message.Subscriber`
   implementation over `StreamReader`), `Router` wrapper, and a slog logger adapter.
-  Imports Watermill, never go-redis. Its handler seam (`MessageHandler`) takes only
-  `[]byte` + `map[string]string`, which is what keeps Watermill types out of the root.
+  Imports Watermill throughout, and go-redis in exactly one file: `publisher.go`,
+  because `redisstream.PublisherConfig` wants a `*goredis.Client` and there is no
+  seam to hide it behind. `subscriber.go` needs no such import — it reads through
+  `internal/redis.StreamReader`, which is the whole reason that interface exists.
+  Its handler seam (`MessageHandler`) takes only `[]byte` + `map[string]string`,
+  which is what keeps Watermill types out of the root.
 
 A golangci-lint `depguard` rule in `.golangci.yml` enforces the boundary: those three
 modules are denied outside `**/internal/**`. If you find yourself wanting a Watermill
