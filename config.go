@@ -113,8 +113,10 @@ type RetryConfig struct {
 
 // TelemetryConfig configures observability integration. Logger is defaulted
 // by Validate and is used throughout the consume path — the subscriber's
-// loops, dispatch, and watermill's own router logs all go through it. The
-// tracer and meter providers, the propagator, and LogPayloads are all live.
+// loops, dispatch, and watermill's own router logs all go through it.
+// Propagator is defaulted here and carries trace context across the
+// publish/consume boundary. The tracer and meter providers are defaulted but
+// still inert: span creation and metric emission arrive later in Phase 3.
 type TelemetryConfig struct {
 	TracerProvider trace.TracerProvider
 	MeterProvider  metric.MeterProvider
@@ -130,8 +132,8 @@ type TelemetryConfig struct {
 	// Baggage is deliberately not composited in: PRD §5's transport
 	// metadata table lists traceparent and tracestate and nothing else.
 	// Applications wanting baggage pass their own composite here.
-	Propagator propagation.TextMapPropagator
-	Logger     *slog.Logger
+	Propagator  propagation.TextMapPropagator
+	Logger      *slog.Logger
 	LogPayloads bool
 }
 
