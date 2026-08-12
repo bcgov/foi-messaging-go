@@ -16,6 +16,11 @@ import (
 	internalwatermill "github.com/bcgov/foi-messaging-go/internal/watermill"
 )
 
+// dlqPublishTimeout bounds a dead letter written from the subscriber's
+// undecodable-entry hook, whose context is deliberately detached from Run's
+// so a drain in progress still records the entry.
+const dlqPublishTimeout = 5 * time.Second
+
 // Consumer subscribes to the topics its registered handlers cover and
 // dispatches each event to the handler matching its event type and major
 // schema version.
@@ -175,6 +180,15 @@ func (c *Consumer) Run(ctx context.Context) error {
 	c.dlq = redisDeadLetterSink{pub: dlqPublisher}
 	c.mu.Unlock()
 
+	// The hook below is handed a Redis stream name, but dead-lettering is
+	// expressed in logical topics, so the mapping Run already computes for
+	// AddHandler is inverted once here rather than parsed back out of the
+	// stream name.
+	topicByStream := make(map[string]string, len(topics))
+	for _, topic := range topics {
+		topicByStream[c.streamName(topic)] = topic
+	}
+
 	// The application's logger is threaded into both halves: without it the
 	// subscriber's read-loop, claim-loop and ack failures, and watermill's
 	// own handler-error line, all go to a NopLogger or the stdlib logger
@@ -185,6 +199,41 @@ func (c *Consumer) Run(ctx context.Context) error {
 		ClaimInterval: c.cfg.Consumer.ClaimInterval,
 		ClaimMinIdle:  c.cfg.Consumer.ClaimMinIdle,
 		Logger:        c.cfg.Telemetry.Logger,
+		OnUndecodable: func(stream, entryID string, fields map[string]any) error {
+			topic, ok := topicByStream[stream]
+			if !ok {
+				return fmt.Errorf("no topic registered for stream %q", stream)
+			}
+
+			// The original bytes are unreachable — the marshaller failed
+			// before producing a payload — so the raw Redis fields are what
+			// gets preserved. PRD §14 did not anticipate a
+			// marshaller-level failure; this is the nearest thing to
+			// "the raw bytes" that exists at this point.
+			raw, err := json.Marshal(fields)
+			if err != nil {
+				return fmt.Errorf("marshalling fields of undecodable entry %q: %w", entryID, err)
+			}
+
+			dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
+				fmt.Errorf("stream entry %q could not be unmarshalled", entryID), 1)
+			dl.EventRaw = raw
+
+			// Detached from Run's ctx, and timeout-bounded, for the same
+			// reason the subscriber's ack path is: an entry reaching this
+			// hook during the drain must still be recorded, and Run's ctx
+			// is already cancelled by then. Without this the DLQ write
+			// fails with context.Canceled at exactly the moment there is a
+			// backlog to clear.
+			//
+			// The same reasoning does not apply to the DLQ writes inside
+			// dispatch: those run on the message context, which is already
+			// context.WithoutCancel-derived and stays live for the whole
+			// drain.
+			dlqCtx, cancelDLQ := context.WithTimeout(context.WithoutCancel(ctx), dlqPublishTimeout)
+			defer cancelDLQ()
+			return c.deadLetter(dlqCtx, topic, dl)
+		},
 	})
 	if err != nil {
 		_ = c.closeReader(reader)

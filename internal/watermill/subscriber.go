@@ -66,6 +66,20 @@ type SubscriberOptions struct {
 	// discarded, because a consume path that fails silently looks exactly
 	// like a healthy idle one.
 	Logger *slog.Logger
+
+	// OnUndecodable is called for a stream entry that cannot be
+	// unmarshalled at all. Returning nil acks the entry; returning an error
+	// leaves it pending for the next reclaim sweep.
+	//
+	// The hook exists because this failure happens before a message is
+	// produced, so the entry never reaches the consumer's dispatch — the
+	// delivery-attempt cap and the DLQ both live there and neither can see
+	// it. Left nil the subscriber logs and leaves the entry pending, which
+	// re-loops every ClaimMinIdle forever.
+	//
+	// It takes only plain types, so the caller can dead-letter without any
+	// watermill value crossing back over the package boundary.
+	OnUndecodable func(stream, entryID string, fields map[string]any) error
 }
 
 // Subscriber implements watermill's message.Subscriber over Redis Streams,
@@ -78,6 +92,7 @@ type Subscriber struct {
 	claimMinIdle  time.Duration
 	blockTime     time.Duration
 	logger        *slog.Logger
+	onUndecodable func(stream, entryID string, fields map[string]any) error
 
 	closing   chan struct{}
 	wg        sync.WaitGroup
@@ -121,6 +136,7 @@ func NewSubscriber(opts SubscriberOptions) (*Subscriber, error) {
 		claimMinIdle:  opts.ClaimMinIdle,
 		blockTime:     opts.BlockTime,
 		logger:        opts.Logger,
+		onUndecodable: opts.OnUndecodable,
 		closing:       make(chan struct{}),
 	}, nil
 }
@@ -281,14 +297,24 @@ func (sc *subscription) emit(ctx context.Context, e internalredis.Entry, attempt
 
 	msg, err := decodeEntry(e, attempt)
 	if err != nil {
-		// An entry we cannot even decode is left pending rather than
-		// dropped; Phase 2b routes it to the DLQ. Until then this log is
-		// the only trace of an entry that will re-loop every ClaimMinIdle
-		// forever — spec §6 requires an ERROR for an undecodable
-		// envelope, and only the JSON layer's version of that failure was
-		// being logged.
+		// Spec §6 requires an ERROR for an undecodable envelope, and only
+		// the JSON layer's version of that failure was being logged.
 		s.logger.Error("messaging: undecodable stream entry",
 			"stream", sc.stream, "entry_id", e.ID, "error", err)
+
+		if s.onUndecodable != nil {
+			if hookErr := s.onUndecodable(sc.stream, e.ID, e.Fields); hookErr != nil {
+				// The hook owns recording the entry elsewhere. If it
+				// failed, leave the entry pending rather than acking an
+				// event nothing is holding — the same rule the dispatch
+				// path's DLQ writes follow.
+				s.logger.Error("messaging: dead-lettering undecodable entry failed",
+					"stream", sc.stream, "entry_id", e.ID, "error", hookErr)
+			} else {
+				sc.ack(ctx, e.ID)
+			}
+		}
+
 		sc.release()
 		return !s.stopped(ctx)
 	}

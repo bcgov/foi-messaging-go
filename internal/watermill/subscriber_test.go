@@ -587,3 +587,139 @@ func TestSubscriber_TopicsDoNotStarveEachOther(t *testing.T) {
 		}
 	}
 }
+
+// waitForAck blocks until id has been acked, or fails the test.
+func waitForAck(t *testing.T, f *fakeReader, id string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		for _, got := range f.ackedIDs() {
+			if got == id {
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("entry %q was never acked", id)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestSubscriber_UndecodableEntryReachesTheHookAndIsAcked(t *testing.T) {
+	// An entry whose fields the redisstream marshaller cannot read. It
+	// never becomes a message, so nothing downstream can dead-letter it.
+	bad := internalredis.Entry{ID: "1-1", Fields: map[string]any{"garbage": "value"}}
+	reader := newFakeReader(bad)
+
+	type call struct {
+		stream  string
+		entryID string
+	}
+	calls := make(chan call, 1)
+
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:    reader,
+		BlockTime: 10 * time.Millisecond,
+		Logger:    slog.New(slog.DiscardHandler),
+		OnUndecodable: func(stream, entryID string, fields map[string]any) error {
+			calls <- call{stream: stream, entryID: entryID}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := sub.Subscribe(ctx, "foi:documents"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case got := <-calls:
+		if got.stream != "foi:documents" {
+			t.Errorf("stream = %q, want %q", got.stream, "foi:documents")
+		}
+		if got.entryID != "1-1" {
+			t.Errorf("entryID = %q, want %q", got.entryID, "1-1")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnUndecodable was never called")
+	}
+
+	// Acked only after the hook succeeded: the entry is now recorded
+	// somewhere else, so leaving it pending would redeliver it forever.
+	waitForAck(t, reader, "1-1")
+}
+
+func TestSubscriber_UndecodableEntryStaysPendingWhenTheHookFails(t *testing.T) {
+	bad := internalredis.Entry{ID: "1-1", Fields: map[string]any{"garbage": "value"}}
+	reader := newFakeReader(bad)
+
+	called := make(chan struct{}, 1)
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:    reader,
+		BlockTime: 10 * time.Millisecond,
+		Logger:    slog.New(slog.DiscardHandler),
+		OnUndecodable: func(string, string, map[string]any) error {
+			select {
+			case called <- struct{}{}:
+			default:
+			}
+			return errors.New("dlq unavailable")
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := sub.Subscribe(ctx, "foi:documents"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnUndecodable was never called")
+	}
+
+	// Give the read loop room to have acked if it were going to.
+	time.Sleep(200 * time.Millisecond)
+	if reader.ackedIDs() != nil {
+		t.Error("a failed dead-letter must leave the entry pending, not ack it")
+	}
+}
+
+func TestSubscriber_UndecodableEntryWithoutAHookKeepsTheOldBehaviour(t *testing.T) {
+	// Nil-safe: unset, the subscriber logs and leaves the entry pending,
+	// which is what internal/watermill's own tests rely on.
+	bad := internalredis.Entry{ID: "1-1", Fields: map[string]any{"garbage": "value"}}
+	reader := newFakeReader(bad)
+
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:    reader,
+		BlockTime: 10 * time.Millisecond,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := sub.Subscribe(ctx, "foi:documents"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if reader.ackedIDs() != nil {
+		t.Error("without a hook the entry must be left pending")
+	}
+}
