@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 // readMetrics collects everything recorded through reader, keyed by
@@ -275,4 +276,100 @@ type failingMeter struct {
 
 func (fm *failingMeter) Int64Counter(name string, opts ...otelmetric.Int64CounterOption) (otelmetric.Int64Counter, error) {
 	return nil, errors.New("simulated instrument creation failure")
+}
+
+func TestDeliveryRecorder_TerminalInvariant(t *testing.T) {
+	// Spec §2: every delivery increments exactly one of processed /
+	// failed / skipped, and records processing.duration exactly once.
+	// This is the test that keeps that true as exit paths are added.
+	terminal := []string{
+		"messaging.events.processed",
+		"messaging.events.failed",
+		"messaging.events.skipped",
+	}
+
+	tests := []struct {
+		name string
+		act  func(r *deliveryRecorder)
+		want string
+	}{
+		{"processed", func(r *deliveryRecorder) { r.processed() }, "messaging.events.processed"},
+		{"failed", func(r *deliveryRecorder) { r.failed(categoryPermanent, errors.New("boom")) }, "messaging.events.failed"},
+		{"skipped", func(r *deliveryRecorder) { r.skipped(reasonNoHandler) }, "messaging.events.skipped"},
+		{"unset defaults to failed", func(r *deliveryRecorder) {}, "messaging.events.failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mp, reader := newTestMeterProvider(t)
+			inst := newInstruments(mp, slog.Default())
+			r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default())
+
+			tt.act(r)
+			r.end()
+
+			got := readMetrics(t, reader)
+
+			for _, name := range terminal {
+				_, present := got[name]
+				if name == tt.want && !present {
+					t.Errorf("terminal counter %q was not recorded", name)
+				}
+				if name != tt.want && present {
+					t.Errorf("terminal counter %q was recorded; want only %q", name, tt.want)
+				}
+			}
+
+			if _, ok := got["messaging.processing.duration"]; !ok {
+				t.Error("processing.duration was not recorded")
+			}
+		})
+	}
+}
+
+func TestDeliveryRecorder_EndIsIdempotent(t *testing.T) {
+	// The recorder is invoked from a defer on a path that also returns
+	// early; a double end would double-count every delivery.
+	mp, reader := newTestMeterProvider(t)
+	inst := newInstruments(mp, slog.Default())
+	r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default())
+
+	r.processed()
+	r.end()
+	r.end()
+
+	got := readMetrics(t, reader)
+	sum, ok := got["messaging.events.processed"].Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("processed data = %T, want Sum[int64]", got["messaging.events.processed"].Data)
+	}
+	if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != 1 {
+		t.Fatalf("processed = %+v, want a single data point of 1", sum.DataPoints)
+	}
+}
+
+func TestDeliveryRecorder_SetEventTypeAttributesTheOutcome(t *testing.T) {
+	// setEventType is called only on a typed registry match (see
+	// consumeAttrs); confirm it actually reaches the recorded attributes
+	// rather than being tracked and silently dropped at end().
+	mp, reader := newTestMeterProvider(t)
+	inst := newInstruments(mp, slog.Default())
+	r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default())
+
+	r.setEventType("document.filed.v1")
+	r.processed()
+	r.end()
+
+	got := readMetrics(t, reader)
+	sum, ok := got["messaging.events.processed"].Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("processed data = %T, want Sum[int64]", got["messaging.events.processed"].Data)
+	}
+	if len(sum.DataPoints) != 1 {
+		t.Fatalf("processed data points = %d, want 1", len(sum.DataPoints))
+	}
+	val, ok := sum.DataPoints[0].Attributes.Value(attrEventType)
+	if !ok || val.AsString() != "document.filed.v1" {
+		t.Errorf("event_type attribute = %v (present=%v), want %q", val, ok, "document.filed.v1")
+	}
 }

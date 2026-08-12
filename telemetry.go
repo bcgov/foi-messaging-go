@@ -1,11 +1,15 @@
 package messaging
 
 import (
+	"context"
 	"log/slog"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // telemetryScope is the instrumentation scope every instrument and tracer
@@ -180,4 +184,130 @@ func consumeAttrs(topic, group, eventType string, extra ...attribute.KeyValue) [
 		attrs = append(attrs, attribute.String(attrEventType, eventType))
 	}
 	return append(attrs, extra...)
+}
+
+// outcomeKind is the terminal disposition of one delivery. Exactly one is
+// recorded per delivery — see deliveryRecorder.end.
+type outcomeKind int
+
+const (
+	outcomeUnset outcomeKind = iota
+	outcomeProcessed
+	outcomeFailed
+	outcomeSkipped
+)
+
+// deliveryRecorder accumulates the outcome of one delivery and records all
+// of it at once.
+//
+// dispatch has seven terminal exit paths. Instrumenting each in place means
+// twenty-odd statements threaded through the subtlest code in the
+// repository, and every exit path added later is a chance to forget one.
+// Instead each path states its outcome and a single deferred end() records
+// the span status, the duration histogram, and exactly one counter.
+//
+// It also owns the one thing per-site instrumentation cannot get right: the
+// duration histogram and the span need a single start and a single end, and
+// holding both here is the only shape where they cannot drift apart.
+type deliveryRecorder struct {
+	inst  *instruments
+	span  trace.Span
+	log   *slog.Logger
+	topic string
+	group string
+	start time.Time
+
+	kind      outcomeKind
+	category  string
+	reason    string
+	eventType string
+	err       error
+	ended     bool
+}
+
+func newDeliveryRecorder(inst *instruments, span trace.Span, topic, group string, log *slog.Logger) *deliveryRecorder {
+	return &deliveryRecorder{
+		inst:  inst,
+		span:  span,
+		log:   log,
+		topic: topic,
+		group: group,
+		start: time.Now(),
+	}
+}
+
+// setEventType records the event type for metric attribution. It is called
+// only on a typed registry match; see consumeAttrs.
+func (r *deliveryRecorder) setEventType(eventType string) { r.eventType = eventType }
+
+func (r *deliveryRecorder) processed() { r.kind = outcomeProcessed }
+
+func (r *deliveryRecorder) failed(category string, err error) {
+	r.kind = outcomeFailed
+	r.category = category
+	r.err = err
+}
+
+func (r *deliveryRecorder) skipped(reason string) {
+	r.kind = outcomeSkipped
+	r.reason = reason
+}
+
+// end records the delivery. It is idempotent: it is called from a defer on
+// paths that also return early, and a second recording would double-count
+// every delivery.
+func (r *deliveryRecorder) end() {
+	if r.ended {
+		return
+	}
+	r.ended = true
+
+	// context.Background() deliberately, not the delivery's own context:
+	// metric recording only reads a context for exemplars and cancellation,
+	// and the delivery's own context may be cancelled at the shutdown drain
+	// deadline — recording through a cancelled context would silently drop
+	// the observation for exactly the deliveries most worth counting.
+	ctx := context.Background()
+	elapsed := time.Since(r.start).Seconds()
+	base := consumeAttrs(r.topic, r.group, r.eventType)
+
+	r.inst.processingDuration.Record(ctx, elapsed, metric.WithAttributes(base...))
+
+	switch r.kind {
+	case outcomeProcessed:
+		r.inst.processed.Add(ctx, 1, metric.WithAttributes(base...))
+		r.span.SetStatus(codes.Ok, "")
+
+	case outcomeSkipped:
+		r.inst.skipped.Add(ctx, 1, metric.WithAttributes(
+			consumeAttrs(r.topic, r.group, "", attribute.String(attrReason, r.reason))...))
+
+	case outcomeFailed:
+		r.recordFailure(ctx, base)
+
+	default:
+		// Unreachable by design: every dispatch exit path states an
+		// outcome. Treated as a failure rather than silently skipped so
+		// the "exactly one terminal counter" invariant stays literally
+		// true even if a future exit path forgets, and so the omission
+		// is visible in the logs rather than as a quiet gap between
+		// received and the terminal counters.
+		if r.log != nil {
+			r.log.Error("messaging: delivery ended with no recorded outcome; this is a bug in the library",
+				"topic", r.topic)
+		}
+		r.category = "unknown"
+		r.recordFailure(ctx, base)
+	}
+
+	r.span.End()
+}
+
+func (r *deliveryRecorder) recordFailure(ctx context.Context, base []attribute.KeyValue) {
+	r.inst.failed.Add(ctx, 1, metric.WithAttributes(
+		append(base, attribute.String(attrErrorCategory, r.category))...))
+	if r.err != nil {
+		r.span.RecordError(r.err)
+	}
+	r.span.SetStatus(codes.Error, r.category)
 }
