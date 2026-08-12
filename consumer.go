@@ -332,10 +332,12 @@ func (c *Consumer) closeReader(reader *internalredis.StreamReader) error {
 // deserialization failures dead-letter rather than nack, being permanent by
 // definition; then runWithRetry runs the handler.
 //
-// Telemetry is stated, not recorded, on each of the seven terminal exit
-// paths: every path calls one rec.processed/failed/skipped and the single
+// Telemetry is stated, not recorded, at each of dispatch's six return
+// statements — one of which delegates to runWithRetry's own five
+// outcome-stating branches, for ten call sites in total across the two
+// functions: each calls one rec.processed/failed/skipped and the single
 // deferred rec.end() below turns that into the span status, the duration
-// observation, and exactly one terminal counter. Instrumenting each path in
+// observation, and exactly one terminal counter. Instrumenting each site in
 // place would thread twenty-odd statements through the subtlest function in
 // the repository and make every exit path added later a chance to forget
 // one.
@@ -620,8 +622,10 @@ func deliveryAttempt(metadata map[string]string) int64 {
 // being per topic is what keeps the stall from reaching other topics.
 //
 // rec is dispatch's recorder rather than one of this loop's own: the whole
-// loop is one delivery, so its three terminal branches state the outcome
-// for the delivery dispatch already opened a span and started a timer for.
+// loop is one delivery, so each of its five outcome-stating branches
+// (success, discard, permanent failure, retries exhausted, and abandoned
+// mid-backoff) states the outcome for the delivery dispatch already opened
+// a span and started a timer for.
 func (c *Consumer) runWithRetry(
 	ctx context.Context,
 	topic string,

@@ -72,6 +72,7 @@ const (
 	categoryRetryable       = "retryable"
 	categoryDeserialization = "deserialization"
 	categoryMaxAttempts     = "max_attempts"
+	categoryUnknown         = "unknown"
 )
 
 // instruments holds every metric the library records. It is built once per
@@ -226,11 +227,14 @@ const (
 // deliveryRecorder accumulates the outcome of one delivery and records all
 // of it at once.
 //
-// dispatch has seven terminal exit paths. Instrumenting each in place means
-// twenty-odd statements threaded through the subtlest code in the
-// repository, and every exit path added later is a chance to forget one.
-// Instead each path states its outcome and a single deferred end() records
-// the span status, the duration histogram, and exactly one counter.
+// dispatch has six return statements, one of which delegates to
+// runWithRetry — itself five more sites that state an outcome for the same
+// delivery — for ten outcome-stating call sites in total across the two
+// functions. Instrumenting each in place means twenty-odd statements
+// threaded through the subtlest code in the repository, and every exit path
+// added later is a chance to forget one. Instead each path states its
+// outcome and a single deferred end() records the span status, the duration
+// histogram, and exactly one counter.
 //
 // It also owns the one thing per-site instrumentation cannot get right: the
 // duration histogram and the span need a single start and a single end, and
@@ -324,22 +328,37 @@ func (r *deliveryRecorder) end() {
 	case outcomeSkipped:
 		r.inst.skipped.Add(ctx, 1, metric.WithAttributes(
 			consumeAttrs(r.topic, r.group, "", attribute.String(attrReason, r.reason))...))
+		// Ok, not Unset or Error: a skip is a legitimate terminal outcome,
+		// not an in-between state. An event correctly acked with no handler
+		// (topics are shared) or deliberately discarded by the handler is
+		// working as designed, not a failure a trace search for errors
+		// should surface.
+		r.span.SetStatus(codes.Ok, "")
 
 	case outcomeFailed:
 		r.recordFailure(ctx, base)
 
 	default:
-		// Unreachable by design: every dispatch exit path states an
-		// outcome. Treated as a failure rather than silently skipped so
-		// the "exactly one terminal counter" invariant stays literally
-		// true even if a future exit path forgets, and so the omission
-		// is visible in the logs rather than as a quiet gap between
-		// received and the terminal counters.
+		// Unreachable by design on any exit path that returns normally:
+		// every dispatch exit path states an outcome. It is reachable if a
+		// handler panics — the panic unwinds through dispatch, this
+		// deferred end() still runs, and no rec.processed/failed/skipped
+		// call ever happened. There is no recover() anywhere in this
+		// repository, so the process is dying regardless and this branch's
+		// log line will not save it; it exists so whoever is paged is not
+		// misled into thinking the bug is here rather than in the handler
+		// that panicked.
+		//
+		// Treated as a failure rather than silently skipped so the
+		// "exactly one terminal counter" invariant stays literally true
+		// even if a future exit path forgets, and so the omission is
+		// visible in the logs rather than as a quiet gap between received
+		// and the terminal counters.
 		if r.log != nil {
 			r.log.Error("messaging: delivery ended with no recorded outcome; this is a bug in the library",
 				"topic", r.topic)
 		}
-		r.category = "unknown"
+		r.category = categoryUnknown
 		r.recordFailure(ctx, base)
 	}
 

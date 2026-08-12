@@ -124,6 +124,7 @@ func TestMetricLabelContract(t *testing.T) {
 		wantCategoryRetryable       = "retryable"
 		wantCategoryDeserialization = "deserialization"
 		wantCategoryMaxAttempts     = "max_attempts"
+		wantCategoryUnknown         = "unknown"
 	)
 
 	if attrTopic != wantAttrTopic {
@@ -173,6 +174,9 @@ func TestMetricLabelContract(t *testing.T) {
 	}
 	if categoryMaxAttempts != wantCategoryMaxAttempts {
 		t.Errorf("categoryMaxAttempts = %q, want %q", categoryMaxAttempts, wantCategoryMaxAttempts)
+	}
+	if categoryUnknown != wantCategoryUnknown {
+		t.Errorf("categoryUnknown = %q, want %q", categoryUnknown, wantCategoryUnknown)
 	}
 }
 
