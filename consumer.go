@@ -385,10 +385,10 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	}
 
 	c.mu.Lock()
-	handler, ok := c.registry.lookup(topic, env.EventType, major)
+	handler, match := c.registry.lookup(topic, env.EventType, major)
 	c.mu.Unlock()
 
-	if !ok {
+	if match == matchNone {
 		// Topics are shared and services consume only the event types they
 		// care about, so an unmatched event is a normal outcome, not a
 		// failure. Phase 3 counts these as skipped{reason="no_handler"}.

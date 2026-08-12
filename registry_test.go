@@ -17,6 +17,8 @@ func (h *recordingHandler) Handle(_ context.Context, env Envelope[testPayload]) 
 	return nil
 }
 
+func noopDispatch(context.Context, Envelope[json.RawMessage]) error { return nil }
+
 func rawEnvelope(eventType, version string, payload string) Envelope[json.RawMessage] {
 	return Envelope[json.RawMessage]{
 		EventID:       "01234567-89ab-7def-8000-000000000000",
@@ -68,8 +70,8 @@ func TestRegistry_LookupMatchesOnMajorVersionOnly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("majorVersion(%q): %v", version, err)
 		}
-		fn, ok := r.lookup("documents", "document.created", major)
-		if !ok {
+		fn, match := r.lookup("documents", "document.created", major)
+		if match == matchNone {
 			t.Fatalf("no handler found for version %q", version)
 		}
 		if err := fn(context.Background(), rawEnvelope("document.created", version, `{"name":"a.pdf"}`)); err != nil {
@@ -103,8 +105,8 @@ func TestRegistry_DifferentMajorsCoexist(t *testing.T) {
 		t.Fatalf("addTyped v2: %v", err)
 	}
 
-	fn, ok := r.lookup("documents", "document.created", 2)
-	if !ok {
+	fn, match := r.lookup("documents", "document.created", 2)
+	if match == matchNone {
 		t.Fatal("no handler found for major 2")
 	}
 	if err := fn(context.Background(), rawEnvelope("document.created", "2.0.0", `{"name":"b.pdf"}`)); err != nil {
@@ -125,13 +127,13 @@ func TestRegistry_LookupMissReturnsFalse(t *testing.T) {
 		t.Fatalf("addTyped: %v", err)
 	}
 
-	if _, ok := r.lookup("documents", "document.deleted", 1); ok {
+	if _, match := r.lookup("documents", "document.deleted", 1); match != matchNone {
 		t.Error("expected no handler for an unregistered event type")
 	}
-	if _, ok := r.lookup("documents", "document.created", 2); ok {
+	if _, match := r.lookup("documents", "document.created", 2); match != matchNone {
 		t.Error("expected no handler for an unregistered major version")
 	}
-	if _, ok := r.lookup("invoices", "document.created", 1); ok {
+	if _, match := r.lookup("invoices", "document.created", 1); match != matchNone {
 		t.Error("expected no handler on an unregistered topic")
 	}
 }
@@ -229,4 +231,39 @@ func TestRegistry_IsEmpty(t *testing.T) {
 	if r.isEmpty() {
 		t.Error("a registry with a registered handler should not be empty")
 	}
+}
+
+func TestRegistry_LookupReportsHowItMatched(t *testing.T) {
+	// The distinction is telemetry's: a typed match means event_type came
+	// from a set fixed at registration time and is safe as a metric
+	// attribute; a raw match means it is whatever the wire said.
+	t.Run("typed", func(t *testing.T) {
+		r := newRegistry()
+		if err := r.addTyped("documents", "document.created", 1, noopDispatch); err != nil {
+			t.Fatalf("addTyped() = %v, want nil", err)
+		}
+
+		if _, match := r.lookup("documents", "document.created", 1); match != matchTyped {
+			t.Fatalf("lookup() match = %v, want matchTyped", match)
+		}
+	})
+
+	t.Run("raw takes any event type", func(t *testing.T) {
+		r := newRegistry()
+		if err := r.addRaw("documents", noopDispatch); err != nil {
+			t.Fatalf("addRaw() = %v, want nil", err)
+		}
+
+		_, match := r.lookup("documents", "anything.at.all", 7)
+		if match != matchRaw {
+			t.Fatalf("lookup() match = %v, want matchRaw", match)
+		}
+	})
+
+	t.Run("no match", func(t *testing.T) {
+		r := newRegistry()
+		if _, match := r.lookup("documents", "document.created", 1); match != matchNone {
+			t.Fatalf("lookup() match = %v, want matchNone", match)
+		}
+	})
 }
