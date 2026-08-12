@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
@@ -435,4 +436,108 @@ type rawHandlerFunc func(context.Context, Envelope[json.RawMessage]) error
 
 func (f rawHandlerFunc) Handle(ctx context.Context, env Envelope[json.RawMessage]) error {
 	return f(ctx, env)
+}
+
+// recordingSink captures dead letters instead of publishing them, so
+// dispatch's DLQ routing can be asserted without Redis.
+type recordingSink struct {
+	mu      sync.Mutex
+	streams []string
+	bodies  [][]byte
+	err     error
+}
+
+func (s *recordingSink) publish(_ context.Context, stream string, body []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.streams = append(s.streams, stream)
+	s.bodies = append(s.bodies, body)
+	return nil
+}
+
+func (s *recordingSink) only(t *testing.T) DeadLetter {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.bodies) != 1 {
+		t.Fatalf("expected exactly 1 dead letter, got %d", len(s.bodies))
+	}
+	var dl DeadLetter
+	if err := json.Unmarshal(s.bodies[0], &dl); err != nil {
+		t.Fatalf("unmarshalling dead letter: %v", err)
+	}
+	return dl
+}
+
+func TestDeadLetter_WritesToTheTopicsDLQStream(t *testing.T) {
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	sink := &recordingSink{}
+	consumer.dlq = sink
+
+	dl := consumer.newDeadLetter("documents", ReasonPermanent, errors.New("boom"), 3)
+	dl.Event = json.RawMessage(`{"event_id":"abc"}`)
+	if err := consumer.deadLetter(context.Background(), "documents", dl); err != nil {
+		t.Fatalf("deadLetter: %v", err)
+	}
+
+	if got, want := sink.streams[0], "foi:documents.dlq"; got != want {
+		t.Errorf("stream = %q, want %q", got, want)
+	}
+	got := sink.only(t)
+	if got.Reason != ReasonPermanent {
+		t.Errorf("Reason = %q, want %q", got.Reason, ReasonPermanent)
+	}
+	if got.Error != "boom" {
+		t.Errorf("Error = %q, want %q", got.Error, "boom")
+	}
+	if got.DeliveryAttempts != 3 {
+		t.Errorf("DeliveryAttempts = %d, want 3", got.DeliveryAttempts)
+	}
+	if got.OriginalTopic != "documents" {
+		t.Errorf("OriginalTopic = %q, want %q", got.OriginalTopic, "documents")
+	}
+	if got.ConsumerGroup != "test-group" {
+		t.Errorf("ConsumerGroup = %q, want %q", got.ConsumerGroup, "test-group")
+	}
+	if got.ConsumerName == "" {
+		t.Error("ConsumerName must be set so an operator can identify the instance")
+	}
+	if got.DeadLetteredAt.IsZero() {
+		t.Error("DeadLetteredAt must be set")
+	}
+}
+
+func TestDeadLetter_PublishFailureReturnsAnError(t *testing.T) {
+	// The caller nacks on a non-nil return. Acking here would drop the
+	// event with nothing anywhere holding it (PRD §14).
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	consumer.dlq = &recordingSink{err: errors.New("redis down")}
+
+	dl := consumer.newDeadLetter("documents", ReasonPermanent, errors.New("boom"), 1)
+	if err := consumer.deadLetter(context.Background(), "documents", dl); err == nil {
+		t.Error("expected a DLQ publish failure to be reported so the message nacks")
+	}
+}
+
+func TestDeadLetter_WithoutASinkReturnsAnError(t *testing.T) {
+	// Only reachable from a Consumer that was constructed but never run.
+	// Erroring nacks, which is the safe direction.
+	consumer, err := NewConsumer(testConsumerConfig())
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+
+	dl := consumer.newDeadLetter("documents", ReasonPermanent, errors.New("boom"), 1)
+	if err := consumer.deadLetter(context.Background(), "documents", dl); err == nil {
+		t.Error("expected an error when no dead letter sink is configured")
+	}
 }

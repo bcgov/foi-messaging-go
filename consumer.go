@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
 	internalwatermill "github.com/bcgov/foi-messaging-go/internal/watermill"
@@ -23,6 +26,9 @@ type Consumer struct {
 	mu       sync.Mutex
 	registry *registry
 	running  bool
+	// dlq is nil until Run builds it. Guarded by mu for the same reason
+	// reader is: Run writes it while callers may be reading.
+	dlq deadLetterSink
 
 	reader *internalredis.StreamReader
 }
@@ -150,8 +156,21 @@ func (c *Consumer) Run(ctx context.Context) error {
 	client := internalredis.NewClient(redisClientOptions(c.cfg.Redis))
 	reader := internalredis.NewStreamReader(client, c.cfg.Consumer.Group, c.cfg.Consumer.ConsumerName)
 
+	// The DLQ publisher shares Run's client rather than opening a second
+	// connection pool. It is deliberately never Closed here:
+	// internalwatermill.Publisher.Close closes the client it was built
+	// over, and closeReader already owns that client — a second Close
+	// returns ErrClosed from go-redis's pool and would surface as a
+	// spurious teardown failure.
+	dlqPublisher, err := internalwatermill.NewPublisher(client)
+	if err != nil {
+		_ = c.closeReader(reader)
+		return fmt.Errorf("creating dead letter publisher: %w", err)
+	}
+
 	c.mu.Lock()
 	c.reader = reader
+	c.dlq = redisDeadLetterSink{pub: dlqPublisher}
 	c.mu.Unlock()
 
 	// The application's logger is threaded into both halves: without it the
@@ -224,6 +243,9 @@ func (c *Consumer) closeReader(reader *internalredis.StreamReader) error {
 	err := reader.Close()
 	c.mu.Lock()
 	c.reader = nil
+	// Cleared alongside the reader so a Consumer that has finished running
+	// holds no publisher over an already-closed client.
+	c.dlq = nil
 	c.mu.Unlock()
 	return err
 }
@@ -324,4 +346,85 @@ func (c *Consumer) Close() error {
 		return nil
 	}
 	return reader.Close()
+}
+
+// deadLetterSink publishes DeadLetter documents to a DLQ stream.
+//
+// It is an interface so dispatch's DLQ routing is unit-testable without
+// Redis: the failure paths it guards are exactly the ones hardest to
+// provoke against a live broker.
+type deadLetterSink interface {
+	publish(ctx context.Context, stream string, body []byte) error
+}
+
+// redisDeadLetterSink writes dead letters through the Redis client Run
+// already holds for the reader.
+type redisDeadLetterSink struct {
+	pub *internalwatermill.Publisher
+}
+
+func (s redisDeadLetterSink) publish(ctx context.Context, stream string, body []byte) error {
+	// A dead letter is a new stream entry with no meaningful predecessor,
+	// so it gets a fresh id rather than reusing the original event's —
+	// which may not even be readable, on the deserialization paths.
+	id, err := uuid.NewV7()
+	if err != nil {
+		return fmt.Errorf("generating dead letter id: %w", err)
+	}
+	return s.pub.Publish(ctx, stream, id.String(), body, nil)
+}
+
+// newDeadLetter fills in the fields every dead letter carries. The caller
+// sets Event or EventRaw, because only the caller knows whether the bytes
+// it holds are a parseable envelope.
+func (c *Consumer) newDeadLetter(topic, reason string, cause error, attempt int64) DeadLetter {
+	return DeadLetter{
+		DeadLetteredAt:   time.Now().UTC(),
+		Reason:           reason,
+		Error:            cause.Error(),
+		DeliveryAttempts: attempt,
+		ConsumerGroup:    c.cfg.Consumer.Group,
+		ConsumerName:     c.cfg.Consumer.ConsumerName,
+		OriginalTopic:    topic,
+	}
+}
+
+// deadLetter publishes dl to topic's DLQ stream.
+//
+// Returning nil means the caller may ack: the event is durably recorded
+// somewhere else. Returning an error means it must nack — the entry stays
+// pending and the next reclaim sweep retries the DLQ write. While the DLQ
+// is unwritable this loops, which is the correct trade: the alternative
+// acks the event into nothing (PRD §14).
+func (c *Consumer) deadLetter(ctx context.Context, topic string, dl DeadLetter) error {
+	c.mu.Lock()
+	sink := c.dlq
+	c.mu.Unlock()
+
+	stream := c.streamName(topic) + ".dlq"
+
+	if sink == nil {
+		// Only reachable from a Consumer constructed but never run.
+		// Erroring nacks, which keeps the event rather than dropping it.
+		return fmt.Errorf("dead-lettering to %q: no dead letter sink configured", stream)
+	}
+
+	body, err := json.Marshal(dl)
+	if err != nil {
+		return fmt.Errorf("marshalling dead letter for %q: %w", stream, err)
+	}
+
+	if err := sink.publish(ctx, stream, body); err != nil {
+		c.cfg.Telemetry.Logger.Error("messaging: dead letter publish failed",
+			"topic", topic, "dlq_stream", stream, "reason", dl.Reason,
+			"delivery_attempts", dl.DeliveryAttempts, "error", err)
+		return fmt.Errorf("publishing dead letter to %q: %w", stream, err)
+	}
+
+	// Warn, not Info: a dead letter is an event no handler will ever
+	// process, and it needs to be visible without turning on debug logging.
+	c.cfg.Telemetry.Logger.Warn("messaging: event dead-lettered",
+		"topic", topic, "dlq_stream", stream, "reason", dl.Reason,
+		"delivery_attempts", dl.DeliveryAttempts, "error", dl.Error)
+	return nil
 }
