@@ -37,7 +37,14 @@ about the consume path. `examples/telemetry` is its own Go module (nested `go.mo
 holds the test pinning the exported Prometheus metric names. `go test ./...` does cover
 `testing/` (`messagingtest`), which is part of this module.
 
-There is no CI yet; run lint and all three test tiers locally.
+CI (`.github/workflows/ci.yml`) runs three jobs on every pull request and push to
+`main` — `lint`, `test` (unit + `examples/telemetry` + the changelog script test),
+and `integration` — all under `-race -count=1`, via the reusable
+`.github/workflows/verify.yml`. `make verify` runs exactly the same set locally,
+and is what you should run before pushing a release tag: `release.yml` calls the
+same reusable workflow, so a tag whose gates fail produces no GitHub Release —
+but the tag itself still exists, and a module version that reaches
+proxy.golang.org can never be corrected, only superseded.
 
 ## Architecture
 
