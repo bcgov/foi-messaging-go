@@ -55,6 +55,12 @@ Three layers, deliberately separated so the dependency boundary is enforceable:
   Its handler seam (`MessageHandler`) takes only `[]byte` + `map[string]string`,
   which is what keeps Watermill types out of the root.
 
+OpenTelemetry is deliberately **outside** this boundary and is imported by the root
+package directly: `TelemetryConfig` is public API, so applications hand us `TracerProvider`,
+`MeterProvider`, and `Propagator` values. Do not try to hide OTel behind `internal/` — every
+fact worth recording (event type, classification, outcome) is only knowable in the root, and
+`internal/watermill` importing the root would be an import cycle.
+
 A golangci-lint `depguard` rule in `.golangci.yml` enforces the boundary: those three
 modules are denied outside `**/internal/**`. If you find yourself wanting a Watermill
 type in the root package, add a plain-typed seam in `internal/watermill` instead.
@@ -79,6 +85,12 @@ handler. Minor/patch deliberately do not participate, so a `1.0.0` handler recei
 events; JSON decoding must stay lenient (never `DisallowUnknownFields`). A topic has
 either typed handlers or one raw handler, never both. Unmatched events are ACKed and
 logged at debug — topics are shared.
+
+`Consumer.dispatch` states a `deliveryOutcome` on each of its exit paths rather than
+recording telemetry at each one; a single deferred `deliveryRecorder.end()` turns that into
+the span status, the duration histogram, and exactly one terminal counter. `event_type`
+becomes a metric attribute only on a `matchTyped` registry hit — a raw handler takes every
+event on its topic, so its event type is an unbounded wire value.
 
 `Consumer.dispatch` is the whole failure path: the delivery-attempt cap fires
 before decoding (an over-cap event must not spend four handler invocations, and
@@ -124,13 +136,15 @@ travel as in-process message metadata (`_foi_stream_id`, `_foi_delivery_attempt`
 
 ## Implementation status
 
-Phases 0 (scaffolding), 1 (publish), 2a (consume), and 2b (error classification, retry,
-the delivery-attempt cap, DLQ) are done. Not yet implemented:
+Phases 0 (scaffolding), 1 (publish), 2a (consume), 2b (error classification, retry,
+the delivery-attempt cap, DLQ), and 3 (spans and metrics) are done. Not yet implemented:
 
-- **Phase 3** — OTel spans and Prometheus metrics. `TelemetryConfig.TracerProvider`/
-  `MeterProvider` are defaulted but inert; only `Logger` is live.
-- **Phase 4** — the application-facing `testing/` (`messagingtest`) package. `telemetry/`,
-  `testing/` currently hold only `doc.go`.
+- **Phase 4** — the application-facing `testing/` (`messagingtest`) package. `testing/`
+  currently holds only `doc.go`.
+
+`examples/telemetry` is its own Go module, so `go test ./...` from the root does not reach
+it — run `make test-all`, or `make test-examples`. It is a separate module so the Prometheus
+exporter's `client_golang` dependency stays out of the library's `go.mod`.
 
 Keep the README's "Planned: Phase N" markers and `doc.go` honest when a phase lands — past
 review rounds repeatedly caught the docs claiming unimplemented behaviour.

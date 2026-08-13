@@ -20,7 +20,7 @@ Application code interacts only with this library. Watermill, Redis Streams, and
 - At-least-once delivery with three-layer retry and poison-message protection
 - Dead Letter Queue with a defined wrapper contract
 - Correlation-ID propagation across service chains
-- *(Planned: Phase 3)* OpenTelemetry tracing and Prometheus metrics
+- OpenTelemetry tracing and OTel metrics, exportable to Prometheus
 - Structured logging via `slog`
 - *(Planned: Phase 4)* A `testing/` package for unit-testing handlers without Redis
 
@@ -175,13 +175,67 @@ Redis auth/TLS, pool sizing, consumer concurrency, and claim intervals are all c
 
 ## Observability
 
-Consumers emit structured `slog` logs when an envelope cannot be decoded, fails validation, or carries an unparseable schema version, a warning whenever an event is dead-lettered or discarded, and a debug log when no registered handler matches an event. Logged fields include `topic`, `event_id`, `event_type` (when a handler is not found), and `error`. Correlation IDs propagate through handler contexts via `context.Context`.
+### Structured logging
 
-> **Planned for Phase 3** — OpenTelemetry tracing with linked spans for publish and consume, and Prometheus metrics covering event counts (published/received/processed/failed), retries, and processing latency.
+Consumers emit structured `slog` logs when an envelope cannot be decoded, fails validation, or carries an unparseable schema version, a warning whenever an event is dead-lettered or discarded, and a debug log when no registered handler matches an event. Logged fields include `topic`, `event_id`, `event_type` (when a handler is not found), `error`, and `trace_id`/`span_id` so a log line and its trace are navigable from each other. Correlation IDs propagate through handler contexts via `context.Context`.
+
+Payload contents are **not** logged by default. Set `Telemetry.LogPayloads: true` to include them on the consume path's error lines. They are never placed in span or metric attributes regardless of that setting, because spans and metrics routinely leave the trust boundary that logs stay inside.
+
+### Tracing
+
+`Publish` opens a producer span; `dispatch` opens a consumer span parented to it, so handlers receive a `context.Context` whose span is a child of the publisher's. Trace context travels as `traceparent` transport metadata, injected and extracted by `Telemetry.Propagator`.
+
+That field defaults to `propagation.TraceContext{}` **directly, not to `otel.GetTextMapPropagator()`** — the OTel global is a no-op until the application sets it, and defaulting from it would silently disable cross-service trace continuity with no error anywhere to explain why.
+
+One span per delivery, not per attempt: immediate retries are recorded as span *events*. Span volume therefore scales with redelivery — a persistently failing event produces up to `MaxDeliveryAttempts` spans. Sampling is the application's decision.
+
+### Metrics
+
+The library records through the OpenTelemetry metric API only. It has no Prometheus dependency; hand it a `MeterProvider` and export however you like. `examples/telemetry` is a working Prometheus wiring.
+
+| Prometheus name | Type | Attributes |
+| --- | --- | --- |
+| `messaging_events_published_total` | counter | topic, event_type |
+| `messaging_publish_failures_total` | counter | topic, event_type, stage |
+| `messaging_events_received_total` | counter | topic |
+| `messaging_events_processed_total` | counter | topic, event_type, group |
+| `messaging_events_failed_total` | counter | topic, event_type\*, group, error_category |
+| `messaging_events_skipped_total` | counter | topic, group, reason |
+| `messaging_retries_total` | counter | topic, event_type, group |
+| `messaging_dlq_total` | counter | topic, group, reason |
+| `messaging_dlq_publish_failures_total` | counter | topic, group, reason |
+| `messaging_processing_duration_seconds` | histogram | topic, event_type, group |
+| `messaging_queue_latency_seconds` | histogram | topic |
+
+Every delivery increments exactly one of `processed`, `failed`, or `skipped`, and records `processing_duration` exactly once. `dlq` is orthogonal and fires alongside `failed` on the dead-letter paths — it answers "what are we giving up on", not "what failed".
+
+\* `event_type` is attached only when the event matched a **typed** handler registration, where it comes from a set fixed at registration time. On the no-handler, raw-handler, and deserialization paths it is whatever the wire said — unbounded, and one bad producer away from exploding your metric store — so it is omitted from metrics and recorded on the span instead.
+
+#### These are per-delivery counters
+
+A retryable failure NACKs, and the entry is later reclaimed and redelivered. **One event therefore increments `received` once per delivery**, up to `MaxDeliveryAttempts + 1` times. `received` exceeding `published` is redelivery working as designed, not double-counting.
+
+#### `processing_duration` includes the dead-letter write
+
+On the four dead-letter paths the histogram covers the DLQ publish as well as decode and handler time, because that write genuinely occupies the delivery's concurrency slot. A DLQ outage will therefore show up as a p99 `processing_duration_seconds` spike *and* in `messaging_dlq_publish_failures_total`. That correlation is expected; the second metric is the one that tells you which it is.
+
+#### `queue_latency` depends on clock sync
+
+`published_at` is stamped by the publishing host and read by the consuming host, so `messaging_queue_latency_seconds` measures elapsed time **plus clock skew**. Negative values are clamped to zero. It is only as trustworthy as your fleet's NTP. A missing or unparseable `published_at` skips the observation rather than failing the delivery.
+
+#### The histogram bucket View is required
+
+The OTel Prometheus exporter's default histogram boundaries are millisecond-scaled (`0, 5, 10, ... 10000`). Both of the library's histograms are in **seconds**, so without an explicit View every realistic observation lands in the first bucket and both render as flat lines. The library cannot fix this — your application owns the `MeterProvider` and therefore owns the Views.
+
+Copy the View from [`examples/telemetry`](examples/telemetry/main.go). Omitting it is the most likely way to finish integrating and still be unable to see your own latency.
+
+The exporter also adds `otel_scope_name`/`otel_scope_version` labels to every series and a `target_info` series. Both are normal.
 
 ## Testing
 
 > **Planned for Phase 4** — The `testing/` package will let applications unit-test handlers and publish paths without a Redis instance.
+
+The library's own suite has three tiers: `make test` (unit), `make test-examples` (the nested `examples/telemetry` module, which `./...` does not reach), and `make test-integration` (needs Docker). `make test-all` runs the first two.
 
 Integration tests in this repository use [Testcontainers](https://testcontainers.com/) against real Redis.
 
@@ -192,7 +246,8 @@ foi-messaging-go/
 ├── config.go        envelope.go     eventdef.go
 ├── publisher.go     consumer.go     handler.go
 ├── validation.go    errors.go       context.go     dlq.go
-├── telemetry/       testing/        examples/
+├── telemetry.go     registry.go
+├── testing/         examples/
 └── internal/
     ├── watermill/
     └── redis/

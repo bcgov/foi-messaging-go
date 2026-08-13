@@ -485,8 +485,28 @@ Recommended metrics:
 * `messaging_dlq_total` (labeled by reason)
 * `messaging_dlq_publish_failures_total`
 * `messaging_processing_duration_seconds` (histogram)
+* `messaging_publish_failures_total` (labeled by stage: `validation`, `marshal`, `transport`) — *added during Phase 3 design*
+* `messaging_queue_latency_seconds` (histogram) — *added during Phase 3 design*
 
-All metrics are labeled with topic, event type, and consumer group where applicable.
+The last two were not in this section originally. `messaging_publish_failures_total` was
+added because `Publish` returning its error synchronously leaves publish success rate
+unobservable from the library's own dashboards, pushing an identical hand-rolled counter
+into every service; its `stage` label separates "this service is emitting garbage" from
+"Redis is unreachable". `messaging_queue_latency_seconds` was added because
+`messaging_processing_duration_seconds` starts at dispatch and therefore cannot distinguish
+"our handlers are slow" from "we are behind on the stream".
+
+All metrics are labeled with topic, event type, and consumer group where applicable, with
+one deliberate exception: **event type is attached only when the event matched a typed
+handler registration.** On the no-handler, raw-handler, and deserialization paths the event
+type is read off the wire and is therefore unbounded — a buggy or hostile producer could
+mint unlimited label values. Those paths omit it from metrics and record it on the span
+instead, where high cardinality is what the backend is built for.
+
+**These counters are per-delivery, not per-event.** A retryable failure NACKs and the entry
+is later reclaimed, so one event increments `messaging_events_received_total` once per
+delivery, up to `MaxDeliveryAttempts + 1` times. Received exceeding published is redelivery
+working as designed.
 
 ---
 
