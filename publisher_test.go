@@ -163,8 +163,20 @@ func TestPublish_RecordsSpanAndMetadata(t *testing.T) {
 		t.Errorf("span kind = %v, want Producer", got)
 	}
 
-	if _, ok := readMetrics(t, reader)["messaging.events.published"]; !ok {
-		t.Error("messaging.events.published was not recorded")
+	m, ok := readMetrics(t, reader)["messaging.events.published"]
+	if !ok {
+		t.Fatal("messaging.events.published was not recorded")
+	}
+	// Pinning topic/event_type, not just the counter's existence: deleting
+	// the attribute.String(attrEventType, def.Type) call in Publish would
+	// otherwise pass this test while silently losing the dimension every
+	// publish dashboard is cut by.
+	attrs := terminalCounterAttrs(t, m)
+	if got, found := attrs.Value(attribute.Key(attrTopic)); !found || got.AsString() != def.Topic {
+		t.Errorf("published topic = %q, want %q", got.AsString(), def.Topic)
+	}
+	if got, found := attrs.Value(attribute.Key(attrEventType)); !found || got.AsString() != def.Type {
+		t.Errorf("published event_type = %q, want %q", got.AsString(), def.Type)
 	}
 }
 
@@ -213,6 +225,14 @@ func TestPublish_RecordsValidationFailureStage(t *testing.T) {
 	if !found || stage.AsString() != stageValidation {
 		t.Errorf("stage = %v, want %q", stage.AsString(), stageValidation)
 	}
+	// See TestPublish_RecordsSpanAndMetadata for why topic/event_type are
+	// asserted here rather than left to the counter's mere presence.
+	if got, found := sum.DataPoints[0].Attributes.Value(attribute.Key(attrTopic)); !found || got.AsString() != def.Topic {
+		t.Errorf("publish.failures topic = %q, want %q", got.AsString(), def.Topic)
+	}
+	if got, found := sum.DataPoints[0].Attributes.Value(attribute.Key(attrEventType)); !found || got.AsString() != def.Type {
+		t.Errorf("publish.failures event_type = %q, want %q", got.AsString(), def.Type)
+	}
 }
 
 func TestPublish_RecordsMarshalFailureStage(t *testing.T) {
@@ -258,6 +278,14 @@ func TestPublish_RecordsMarshalFailureStage(t *testing.T) {
 	stage, found := sum.DataPoints[0].Attributes.Value(attribute.Key(attrStage))
 	if !found || stage.AsString() != stageMarshal {
 		t.Errorf("stage = %v, want %q", stage.AsString(), stageMarshal)
+	}
+	// See TestPublish_RecordsSpanAndMetadata for why topic/event_type are
+	// asserted here rather than left to the counter's mere presence.
+	if got, found := sum.DataPoints[0].Attributes.Value(attribute.Key(attrTopic)); !found || got.AsString() != def.Topic {
+		t.Errorf("publish.failures topic = %q, want %q", got.AsString(), def.Topic)
+	}
+	if got, found := sum.DataPoints[0].Attributes.Value(attribute.Key(attrEventType)); !found || got.AsString() != def.Type {
+		t.Errorf("publish.failures event_type = %q, want %q", got.AsString(), def.Type)
 	}
 }
 

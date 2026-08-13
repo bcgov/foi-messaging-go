@@ -953,6 +953,18 @@ func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
 		register bool
 		want     string
 
+		// retryConfig overrides c.cfg.Retry when non-nil. Only the two
+		// retryable rows need this: they must reach runWithRetry's two
+		// categoryRetryable sites (consumer.go:745, :753) without the
+		// test actually waiting out a real backoff.
+		retryConfig *RetryConfig
+
+		// cancelBeforeDispatch dispatches with an already-cancelled
+		// context, so sleepWithJitter abandons the retry mid-backoff
+		// (consumer.go:753) instead of exhausting the immediate-retry
+		// count (consumer.go:745).
+		cancelBeforeDispatch bool
+
 		// wantLabel and wantLabelValue pin the series, not merely the
 		// counter. error_category and reason are the dimensions
 		// operators cut alerts on, so a terminal counter firing with
@@ -1012,6 +1024,41 @@ func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
 			wantEventType:  "document.created",
 		},
 		{
+			// The other of the two error_category="retryable" exits
+			// (consumer.go:745). Without a row for it, replacing the
+			// category argument at either call site with categoryPermanent
+			// leaves this table fully green — the highest-volume failure
+			// category in production, driving redelivery/DLQ alerting,
+			// would go unasserted.
+			name:           "retries exhausted",
+			payload:        validEnvelope("document.created"),
+			handler:        func(context.Context, Envelope[json.RawMessage]) error { return errBoom },
+			register:       true,
+			retryConfig:    &RetryConfig{MaxImmediateRetries: 1, InitialBackoff: time.Nanosecond, MaxBackoff: time.Nanosecond},
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryRetryable,
+			wantEventType:  "document.created",
+		},
+		{
+			// consumer.go:753: the loop still had immediate retries left,
+			// but sleepWithJitter's ctx was cancelled mid-backoff (e.g. the
+			// shutdown drain deadline). This is a distinct call site from
+			// "retries exhausted" above — reachable only when the retry
+			// budget has NOT yet run out — so a mutation of just this site
+			// would not be caught by that row alone.
+			name:                 "abandoned mid-backoff",
+			payload:              validEnvelope("document.created"),
+			handler:              func(context.Context, Envelope[json.RawMessage]) error { return errBoom },
+			register:             true,
+			retryConfig:          &RetryConfig{MaxImmediateRetries: 1, InitialBackoff: 0, MaxBackoff: 0},
+			cancelBeforeDispatch: true,
+			want:                 "messaging.events.failed",
+			wantLabel:            attrErrorCategory,
+			wantLabelValue:       categoryRetryable,
+			wantEventType:        "document.created",
+		},
+		{
 			name:           "undecodable",
 			payload:        []byte("{not json"),
 			want:           "messaging.events.failed",
@@ -1056,6 +1103,9 @@ func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
 			mp, reader := newTestMeterProvider(t)
 			c := newTestConsumerWithTelemetry(t, mp)
 			c.dlq = &recordingSink{}
+			if tt.retryConfig != nil {
+				c.cfg.Retry = *tt.retryConfig
+			}
 
 			if tt.register {
 				h := tt.handler
@@ -1065,7 +1115,14 @@ func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
 				}
 			}
 
-			_ = c.dispatch(context.Background(), "documents", tt.payload, tt.metadata)
+			ctx := context.Background()
+			if tt.cancelBeforeDispatch {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+
+			_ = c.dispatch(ctx, "documents", tt.payload, tt.metadata)
 
 			got := readMetrics(t, reader)
 			for _, name := range terminal {
@@ -1339,16 +1396,25 @@ func TestHandleUndecodable_CountsReceivedAndDeadLetters(t *testing.T) {
 	if !ok {
 		t.Fatal("messaging.events.received was not recorded for an undecodable entry")
 	}
-	if _, ok := got["messaging.dlq"]; !ok {
+	dlq, ok := got["messaging.dlq"]
+	if !ok {
 		t.Fatal("messaging.dlq was not recorded for an undecodable entry")
 	}
 
 	// Both counters fired exactly once, which is the invariant: dlq must
-	// never exceed received on this path.
+	// never exceed received on this path. terminalCounterAttrs enforces
+	// the "exactly once" half for both; presence-checking the map key
+	// above only proves "at least once".
 	receivedAttrs := terminalCounterAttrs(t, received)
 	topic, found := receivedAttrs.Value(attribute.Key(attrTopic))
 	if !found || topic.AsString() != "documents" {
 		t.Errorf("received topic = %q, want %q", topic.AsString(), "documents")
+	}
+
+	dlqAttrs := terminalCounterAttrs(t, dlq)
+	reason, found := dlqAttrs.Value(attribute.Key(attrReason))
+	if !found || reason.AsString() != ReasonDeserializationFailed {
+		t.Errorf("dlq reason = %q, want %q", reason.AsString(), ReasonDeserializationFailed)
 	}
 
 	dl := sink.only(t)
@@ -1483,7 +1549,13 @@ func TestDispatch_LogPayloadsAndTraceCorrelation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			mp, _ := newTestMeterProvider(t)
-			tp := sdktrace.NewTracerProvider()
+			// A recorder rather than a bare TracerProvider: asserting mere
+			// key presence let `sc := span.SpanContext()` degrade to `var
+			// sc trace.SpanContext` (consumer.go:415) — an all-zero span
+			// context — without failing anything. Capturing the real
+			// ended span lets the assertion pin the exact ID logged.
+			recorder := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
 
 			c := newTestConsumerWithTelemetry(t, mp)
 			c.cfg.Telemetry.Logger = slog.New(slog.NewJSONHandler(&buf,
@@ -1501,11 +1573,23 @@ func TestDispatch_LogPayloadsAndTraceCorrelation(t *testing.T) {
 			if got := strings.Contains(out, "hunter2"); got != tt.wantPayload {
 				t.Errorf("log contains payload = %v, want %v\nlog: %s", got, tt.wantPayload, out)
 			}
-			if !strings.Contains(out, `"trace_id"`) {
-				t.Errorf("log is missing trace_id\nlog: %s", out)
+
+			spans := recorder.Ended()
+			if len(spans) != 1 {
+				t.Fatalf("recorded %d spans, want 1", len(spans))
 			}
-			if !strings.Contains(out, `"span_id"`) {
-				t.Errorf("log is missing span_id\nlog: %s", out)
+			sc := spans[0].SpanContext()
+			if !sc.IsValid() {
+				t.Fatalf("delivery span context is invalid; test setup is broken")
+			}
+			// Pinning the exact IDs, not just the keys' presence: a bug
+			// that logs a zero-valued trace_id/span_id must fail this,
+			// same as a bug that omits the fields outright.
+			if wantTraceID := `"trace_id":"` + sc.TraceID().String() + `"`; !strings.Contains(out, wantTraceID) {
+				t.Errorf("log trace_id does not match the delivery's span (want %s)\nlog: %s", wantTraceID, out)
+			}
+			if wantSpanID := `"span_id":"` + sc.SpanID().String() + `"`; !strings.Contains(out, wantSpanID) {
+				t.Errorf("log span_id does not match the delivery's span (want %s)\nlog: %s", wantSpanID, out)
 			}
 		})
 	}
@@ -1518,7 +1602,8 @@ func TestRunWithRetry_LogsCarryTraceCorrelation(t *testing.T) {
 	// an operator most wants to jump to a trace from.
 	var buf bytes.Buffer
 	mp, _ := newTestMeterProvider(t)
-	tp := sdktrace.NewTracerProvider()
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
 
 	c := newTestConsumerWithTelemetry(t, mp)
 	c.cfg.Telemetry.Logger = slog.New(slog.NewJSONHandler(&buf,
@@ -1539,6 +1624,17 @@ func TestRunWithRetry_LogsCarryTraceCorrelation(t *testing.T) {
 		t.Fatalf("dispatch() = %v, want nil", err)
 	}
 
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(spans))
+	}
+	sc := spans[0].SpanContext()
+	if !sc.IsValid() {
+		t.Fatalf("delivery span context is invalid; test setup is broken")
+	}
+	wantTraceID := `"trace_id":"` + sc.TraceID().String() + `"`
+	wantSpanID := `"span_id":"` + sc.SpanID().String() + `"`
+
 	// The permanent-error line comes from runWithRetry, not dispatch.
 	out := buf.String()
 	if !strings.Contains(out, "handler returned a permanent error") {
@@ -1546,7 +1642,9 @@ func TestRunWithRetry_LogsCarryTraceCorrelation(t *testing.T) {
 	}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if strings.Contains(line, "handler returned a permanent error") {
-			if !strings.Contains(line, `"trace_id"`) || !strings.Contains(line, `"span_id"`) {
+			// Pinning the exact IDs, not just the keys' presence — see
+			// TestDispatch_LogPayloadsAndTraceCorrelation for why.
+			if !strings.Contains(line, wantTraceID) || !strings.Contains(line, wantSpanID) {
 				t.Errorf("runWithRetry line lost its trace correlation:\n%s", line)
 			}
 		}
