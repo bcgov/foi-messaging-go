@@ -1,9 +1,11 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -1460,5 +1462,93 @@ func TestDispatch_QueueLatency(t *testing.T) {
 				t.Errorf("queue.latency sum = %v, want exactly 0 for a future published_at", dp.Sum)
 			}
 		})
+	}
+}
+
+func TestDispatch_LogPayloadsAndTraceCorrelation(t *testing.T) {
+	// Two separate contracts share this test because they share a logger:
+	// payload bytes must appear on error lines only when LogPayloads is on,
+	// and trace_id/span_id must always be present so a log line and its
+	// trace are navigable from each other.
+	tests := []struct {
+		name        string
+		logPayloads bool
+		wantPayload bool
+	}{
+		{"payloads off", false, false},
+		{"payloads on", true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			mp, _ := newTestMeterProvider(t)
+			tp := sdktrace.NewTracerProvider()
+
+			c := newTestConsumerWithTelemetry(t, mp)
+			c.cfg.Telemetry.Logger = slog.New(slog.NewJSONHandler(&buf,
+				&slog.HandlerOptions{Level: slog.LevelDebug}))
+			c.cfg.Telemetry.LogPayloads = tt.logPayloads
+			c.tracer = tp.Tracer(telemetryScope)
+			c.dlq = &recordingSink{}
+
+			// An undecodable payload takes an error path, which is where
+			// payloads are logged if at all.
+			_ = c.dispatch(context.Background(), "documents",
+				[]byte(`{"secret":"hunter2"`), nil)
+
+			out := buf.String()
+			if got := strings.Contains(out, "hunter2"); got != tt.wantPayload {
+				t.Errorf("log contains payload = %v, want %v\nlog: %s", got, tt.wantPayload, out)
+			}
+			if !strings.Contains(out, `"trace_id"`) {
+				t.Errorf("log is missing trace_id\nlog: %s", out)
+			}
+			if !strings.Contains(out, `"span_id"`) {
+				t.Errorf("log is missing span_id\nlog: %s", out)
+			}
+		})
+	}
+}
+
+func TestRunWithRetry_LogsCarryTraceCorrelation(t *testing.T) {
+	// The retry loop builds its own logger. It must extend dispatch's
+	// rather than starting from the config logger, or every retry and
+	// handler-failure line silently loses its trace correlation — the lines
+	// an operator most wants to jump to a trace from.
+	var buf bytes.Buffer
+	mp, _ := newTestMeterProvider(t)
+	tp := sdktrace.NewTracerProvider()
+
+	c := newTestConsumerWithTelemetry(t, mp)
+	c.cfg.Telemetry.Logger = slog.New(slog.NewJSONHandler(&buf,
+		&slog.HandlerOptions{Level: slog.LevelDebug}))
+	c.tracer = tp.Tracer(telemetryScope)
+	c.dlq = &recordingSink{}
+	c.cfg.Retry.InitialBackoff = time.Nanosecond
+	c.cfg.Retry.MaxBackoff = time.Nanosecond
+
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	if err := RegisterHandler(c, def, handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		return AsPermanent(errors.New("nope"))
+	})); err != nil {
+		t.Fatalf("RegisterHandler() = %v, want nil", err)
+	}
+
+	if err := c.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("dispatch() = %v, want nil", err)
+	}
+
+	// The permanent-error line comes from runWithRetry, not dispatch.
+	out := buf.String()
+	if !strings.Contains(out, "handler returned a permanent error") {
+		t.Fatalf("expected the permanent-error line\nlog: %s", out)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.Contains(line, "handler returned a permanent error") {
+			if !strings.Contains(line, `"trace_id"`) || !strings.Contains(line, `"span_id"`) {
+				t.Errorf("runWithRetry line lost its trace correlation:\n%s", line)
+			}
+		}
 	}
 }

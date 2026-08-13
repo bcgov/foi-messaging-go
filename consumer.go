@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"strconv"
 	"sync"
@@ -408,10 +409,25 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 			attribute.String(attrTopic, topic)))
 	}
 
+	// trace_id and span_id are what make a log line and a trace navigable
+	// from each other. PRD §16's field list does not name them; reconciling
+	// the rest of that list is out of scope for Phase 3.
+	sc := span.SpanContext()
 	log := c.cfg.Telemetry.Logger.With(
 		"stream_id", metadata[internalwatermill.MetadataStreamID],
 		"delivery_attempt", metadata[internalwatermill.MetadataDeliveryAttempt],
+		"trace_id", sc.TraceID().String(),
+		"span_id", sc.SpanID().String(),
 	)
+
+	// PRD §16: payload contents are not logged by default. When enabled
+	// they appear on the consume path's error lines only — and never in
+	// span attributes or metric attributes, whatever this is set to,
+	// because spans and metrics routinely leave the trust boundary that
+	// logs stay inside.
+	if c.cfg.Telemetry.LogPayloads {
+		log = log.With("payload", string(payload))
+	}
 
 	attempt := deliveryAttempt(metadata)
 	span.SetAttributes(attribute.Int64("messaging.foi.delivery_attempt", attempt))
@@ -518,7 +534,7 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	}
 
 	ctx = contextWithCorrelationID(ctx, env.CorrelationID)
-	return c.runWithRetry(ctx, topic, payload, attempt, handler, env, rec)
+	return c.runWithRetry(ctx, topic, payload, attempt, handler, env, rec, log)
 }
 
 // streamName maps a logical topic to its Redis stream.
@@ -684,8 +700,12 @@ func (c *Consumer) runWithRetry(
 	handler dispatchFunc,
 	env Envelope[json.RawMessage],
 	rec *deliveryRecorder,
+	log *slog.Logger,
 ) error {
-	log := c.cfg.Telemetry.Logger.With(
+	// Extends dispatch's logger rather than starting from the config one,
+	// so the trace correlation fields and any gated payload survive into
+	// the retry loop's lines.
+	log = log.With(
 		"topic", topic, "event_type", env.EventType,
 		"schema_version", env.SchemaVersion, "event_id", env.EventID,
 		"delivery_attempt", attempt,
