@@ -59,7 +59,7 @@ Reproduces what the router installs around a handler invocation, and
 nothing else.
 
 | Does | Does not |
-|---|---|
+| --- | --- |
 | Install the same context values the router installs | Retry |
 | Propagate envelope metadata | ACK / NACK |
 | Invoke the handler | Reclaim |
@@ -133,7 +133,7 @@ Three things `testing/` needs are unexported in the root package, and no
 exported path reaches any of them:
 
 | Need | Blocker |
-|---|---|
+| --- | --- |
 | Install the correlation ID as the router does | `contextWithCorrelationID` unexported (`context.go:9`) |
 | Run the real `dispatch` | Unexported; its only caller is the router, which `Run` builds, and `Run` needs Redis |
 | Capture dead letters | `Consumer.dlq` is nil until `Run`; `deadLetter` returns `"no dead letter sink configured"` and nacks without it (`consumer.go:643`) |
@@ -581,7 +581,7 @@ Guarding the §1 principle:
    attempt stalls rather than being refused):
 
    | Call | Result |
-   |---|---|
+   | --- | --- |
    | `NewPublisher` | returned in 315µs, no error — no dial |
    | `Publish` | stalled the full 3s to the context deadline — the dial happens here |
    | `Close` | returned in 75µs, nil — safe without a connection |
@@ -607,7 +607,7 @@ CLAUDE.md records that past review rounds repeatedly caught the docs
 claiming unimplemented behaviour.
 
 | File | Change |
-|---|---|
+| --- | --- |
 | `testing/doc.go` | Replace the "Phase 0 scaffolding only" stub with the real package doc |
 | `doc.go:23` | Remove "The application-facing testing package (Phase 4) is not yet implemented." |
 | `README.md:25, 238, 252, 258` | Remove the four "Planned: Phase 4" markers; write the Testing section |
