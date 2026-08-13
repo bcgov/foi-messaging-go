@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
+	"github.com/bcgov/foi-messaging-go/internal/testseam"
 	internalwatermill "github.com/bcgov/foi-messaging-go/internal/watermill"
 )
 
@@ -386,7 +387,13 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 			attribute.String("messaging.foi.stream_id", metadata[internalwatermill.MetadataStreamID]),
 		))
 
-	rec := newDeliveryRecorder(c.inst, span, topic, c.cfg.Consumer.Group, c.cfg.Telemetry.Logger)
+	// One of the two ctx.Value lookups a delivery pays for messagingtest
+	// (the other is in deadLetter). Both return nil in production. That
+	// cost buys Dispatch its freedom from locking and from mutating the
+	// application's Consumer — see internal/testseam. Do not "optimise"
+	// this into a field on Consumer without reading that comment.
+	probe := testseam.FromContext(ctx)
+	rec := newDeliveryRecorder(c.inst, span, topic, c.cfg.Consumer.Group, c.cfg.Telemetry.Logger, probe)
 	// The only thing guaranteeing the span is closed when a handler is
 	// abandoned at the drain deadline: message contexts are
 	// context.WithoutCancel-derived and stay live for the whole
@@ -598,6 +605,16 @@ type redisDeadLetterSink struct {
 	pub *internalwatermill.Publisher
 }
 
+// probeSink adapts a testseam.Probe's sink function to deadLetterSink, so
+// the probe path and the Redis path go through the identical code in
+// deadLetter — including its marshalling, its metrics, and the ack/nack
+// contract on its return value.
+type probeSink func(ctx context.Context, stream string, body []byte) error
+
+func (f probeSink) publish(ctx context.Context, stream string, body []byte) error {
+	return f(ctx, stream, body)
+}
+
 func (s redisDeadLetterSink) publish(ctx context.Context, stream string, body []byte) error {
 	// A dead letter is a new stream entry with no meaningful predecessor,
 	// so it gets a fresh id rather than reusing the original event's —
@@ -635,6 +652,13 @@ func (c *Consumer) deadLetter(ctx context.Context, topic string, dl DeadLetter) 
 	c.mu.Lock()
 	sink := c.dlq
 	c.mu.Unlock()
+
+	// A probe replaces the sink outright. messagingtest drives this
+	// function on a Consumer that was never run, where c.dlq is nil and
+	// the guard below would refuse every dead letter.
+	if p := testseam.FromContext(ctx); p != nil && p.Sink != nil {
+		sink = probeSink(p.Sink)
+	}
 
 	stream := c.streamName(topic) + ".dlq"
 
@@ -760,7 +784,15 @@ func (c *Consumer) runWithRetry(
 
 		log.Debug("messaging: retrying handler", "immediate_attempt", i+1, "error", err)
 		rec.retry(i+1, err)
-		if !sleepWithJitter(ctx, backoffUpperBound(c.cfg.Retry, i)) {
+
+		upper := backoffUpperBound(c.cfg.Retry, i)
+		// messagingtest collapses the wait, never the count: an
+		// application asserting "this error is retried three times" must
+		// get the same three invocations it would in production.
+		if rec.probe != nil && rec.probe.NoBackoff {
+			upper = 0
+		}
+		if !sleepWithJitter(ctx, upper) {
 			// Abandoned mid-backoff. Nack so the entry survives.
 			rec.failed(categoryRetryable, err)
 			return err

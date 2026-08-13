@@ -22,7 +22,7 @@ Application code interacts only with this library. Watermill, Redis Streams, and
 - Correlation-ID propagation across service chains
 - OpenTelemetry tracing and OTel metrics, exportable to Prometheus
 - Structured logging via `slog`
-- *(Planned: Phase 4)* A `testing/` package for unit-testing handlers without Redis
+- A `testing/` package for unit-testing handlers and publish paths without Redis
 
 ## Requirements
 
@@ -235,7 +235,51 @@ The exporter also adds `otel_scope_name`/`otel_scope_version` labels to every se
 
 ## Testing
 
-> **Planned for Phase 4** — The `testing/` package will let applications unit-test handlers and publish paths without a Redis instance.
+### Testing your own service
+
+Import `github.com/bcgov/foi-messaging-go/testing` as `messagingtest`. Nothing in it needs Redis or Docker, and it drives the library's real code rather than a simulation of it — so a malformed `EventDef` or a misclassified error fails your unit test rather than production.
+
+**Recording publishes.** `messagingtest.Publisher` wraps a real publisher with only its transport write redirected, so envelope construction, correlation-ID resolution, and validation are genuine:
+
+```go
+pub, _ := messagingtest.NewPublisher()
+defer pub.Close()
+
+svc := NewService(pub) // your code, against your own narrow interface
+svc.CreateOrder(ctx, order)
+
+published := pub.Published()
+payload, _ := messagingtest.PayloadAs[OrderCreated](published[0])
+```
+
+**Testing a handler.** `Deliver` reproduces the handler boundary — it installs the context values the router installs, invokes the handler, and returns its error. It does not retry, ack, or dead-letter:
+
+```go
+err := messagingtest.Deliver(ctx, handler, env)
+```
+
+**Testing what the library would do with it.** `Dispatch` runs the real consume path against your own configured `Consumer`, covering the delivery-attempt cap, error classification, the retry loop, and dead-lettering:
+
+```go
+c, _ := messaging.NewConsumer(messagingtest.Config())
+messaging.RegisterHandler(c, contracts.OrderCreated, handler)
+
+e, _ := messagingtest.NewEvent(contracts.OrderCreated, payload)
+res, _ := messagingtest.Dispatch(ctx, c, e)
+
+res.Outcome              // processed | skipped | dead_lettered | nacked
+res.DeadLetters[0].Reason
+```
+
+Because `Published()` returns the same `Event` type `Dispatch` accepts, one service's publish is the next service's input — a two-service chain, no Redis:
+
+```go
+res, _ := messagingtest.Dispatch(ctx, consumerB, pub.Published()[0])
+```
+
+`Dispatch` reports what the runtime *would do* with a delivery; it does not perform one. There is no ack, no pending entry, and no reclaim — for those, use the integration tier against real Redis.
+
+### The library's own suite
 
 The library's own suite has three tiers: `make test` (unit), `make test-examples` (the nested `examples/telemetry` module, which `./...` does not reach), and `make test-integration` (needs Docker). `make test-all` runs the first two.
 
@@ -255,7 +299,7 @@ foi-messaging-go/
     └── redis/
 ```
 
-Only the top-level package is imported by applications today; the `testing/` package joins it in Phase 4 (see [Testing](#testing)). All Watermill and Redis code stays in `internal/`, enforced by a golangci-lint `depguard` rule (CI enforcement is planned for a later phase).
+Applications import the top-level package, and `testing/` from their tests. All Watermill and Redis code stays in `internal/`, enforced by a golangci-lint `depguard` rule (CI enforcement is planned for a later phase).
 
 ## Roadmap
 

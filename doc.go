@@ -20,5 +20,8 @@
 // the OTel metric API only; see examples/telemetry for Prometheus wiring,
 // including the histogram bucket View that recipe requires.
 //
-// The application-facing testing package (Phase 4) is not yet implemented.
+// The application-facing testing package is implemented: import
+// github.com/bcgov/foi-messaging-go/testing to record publishes, invoke a
+// handler at the router's boundary, and assert what the consume path would
+// do with a delivery — all without Redis.
 package messaging

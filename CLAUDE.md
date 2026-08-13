@@ -34,7 +34,8 @@ Integration tests start their own disposable Redis container per suite via
 skips them entirely because of the build tag, so a passing `make test` proves very little
 about the consume path. `examples/telemetry` is its own Go module (nested `go.mod`), so
 `./...` from the root never runs it — that's what `make test-examples` is for, and it
-holds the test pinning the exported Prometheus metric names.
+holds the test pinning the exported Prometheus metric names. `go test ./...` does cover
+`testing/` (`messagingtest`), which is part of this module.
 
 There is no CI yet; run lint and all three test tiers locally.
 
@@ -69,6 +70,24 @@ fact worth recording (event type, classification, outcome) is only knowable in t
 A golangci-lint `depguard` rule in `.golangci.yml` enforces the boundary: those three
 modules are denied outside `**/internal/**`. If you find yourself wanting a Watermill
 type in the root package, add a plain-typed seam in `internal/watermill` instead.
+
+`internal/testseam` is a fourth, much smaller package: three function variables the
+root registers at `init` (`testhooks.go`) so `testing/` can drive the *real* publish and
+consume paths. It exists because `Consumer.dispatch`, `contextWithCorrelationID`, and a
+dead-letter sink are all unexported with no exported path reaching them — `Consumer.dlq`
+is nil until `Run`, and `deadLetter` refuses to run without one. Moving `dispatch` into
+`internal/` instead is impossible: it needs `Envelope[T]`, `IsPermanent`, `DeadLetter`,
+and the registry, so an internal package holding it would import the root and cycle —
+the same constraint that puts OpenTelemetry outside the boundary. `testseam` imports
+only `context`, so it cannot cycle, and `internal/` keeps it invisible to applications:
+the root's exported API is unchanged by its existence.
+
+The `testseam.Probe` travels on the delivery's **context**, not on the Consumer. That is
+what lets `messagingtest.Dispatch` need no lock, run concurrently against one Consumer,
+and leave the application's Consumer unmutated once it returns. The price is two
+`ctx.Value` lookups per delivery — one in `dispatch`, one in `deadLetter` — both of
+which return nil in production. That price is accepted deliberately; do not "optimise"
+it into a Consumer field.
 
 ### Publish path
 
@@ -141,11 +160,10 @@ travel as in-process message metadata (`_foi_stream_id`, `_foi_delivery_attempt`
 
 ## Implementation status
 
-Phases 0 (scaffolding), 1 (publish), 2a (consume), 2b (error classification, retry,
-the delivery-attempt cap, DLQ), and 3 (spans and metrics) are done. Not yet implemented:
-
-- **Phase 4** — the application-facing `testing/` (`messagingtest`) package. `testing/`
-  currently holds only `doc.go`.
+Every phase is done: 0 (scaffolding), 1 (publish), 2a (consume), 2b (error
+classification, retry, the delivery-attempt cap, DLQ), 3 (spans and metrics), and 4 —
+the application-facing `testing/` (`messagingtest`) package, which holds `Publisher`,
+`Deliver`, `Dispatch`, `NewEvent`, and `Config`.
 
 `examples/telemetry` is its own Go module, so `go test ./...` from the root does not reach
 it — run `make test-all`, or `make test-examples`. It is a separate module so the Prometheus

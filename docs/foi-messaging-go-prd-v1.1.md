@@ -620,9 +620,17 @@ Using Testcontainers with Redis:
 
 The `testing/` package ships with the library and provides:
 
-* `messagingtest.Publisher` — records published events for assertion; no Redis required
-* `messagingtest.Deliver[T](handler, envelope)` — invokes a handler exactly as the router would, including context correlation setup
-* Envelope and `EventDef` builders with sensible defaults
+* `messagingtest.Publisher` — records published events for assertion; no Redis required. It wraps a real `messaging.Publisher` with only its transport write redirected, so correlation-ID resolution, envelope construction, and validation are the real ones.
+* `messagingtest.Deliver[T](ctx, handler, envelope)` — the **handler boundary**: invokes a handler exactly as the router would, including context correlation setup, and returns its error verbatim. It does not retry, ack, nack, reclaim, or dead-letter.
+* `messagingtest.Dispatch(ctx, consumer, event, ...)` — the **router boundary**: runs the library's real consume path against the application's own `Consumer` and reports a terminal `Outcome` (`processed`, `skipped`, `dead_lettered`, `nacked`) plus the decoded `DeadLetter`s. It reports what the runtime *would do* with a delivery; it does not perform one.
+* `messagingtest.NewEvent` — an envelope builder whose defaults pass validation and whose options can invalidate it deliberately, plus `messagingtest.Config()`, a `messaging.Config` that validates without dialing anything.
+
+Two cuts from the sketch above, recorded so they read as decisions:
+
+* **No `EventDef` builder ships.** A test that invents its own `EventDef` stops testing the application's real contract — the definition under test should be the one the application publishes with.
+* **No raw-bytes entry point.** Literally malformed JSON never reaches `dispatch` in production (Watermill's own marshaller rejects the entry first), so that path belongs to the integration tier rather than to `messagingtest`.
+
+Implementation note: the package drives the real code through `internal/testseam`, a set of function variables the root package registers at `init`. The root's exported API is unchanged, and `internal/` keeps the seam invisible to applications.
 
 ---
 
