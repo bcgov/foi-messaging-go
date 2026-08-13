@@ -288,6 +288,15 @@ func (c *Consumer) handleUndecodable(runCtx context.Context, topicByStream map[s
 	// exceed messaging_events_received_total on this path — an invariant
 	// violation that reads as a metrics bug and hides the real one
 	// underneath it.
+	//
+	// Recorded through runCtx directly rather than deliveryRecorder's
+	// Background()-plus-span pattern (telemetry.go end()/retry()): a
+	// marshaller failure happens before dispatch ever runs, so there is no
+	// delivery span here to give an exemplar reservoir anything to attach
+	// to, and it is undecodable specifically because the entry never
+	// became a message dispatch could open one for. runCtx's cancellation
+	// at drain is not a hazard either way — see the comment on
+	// deliveryRecorder.end for why.
 	c.inst.received.Add(runCtx, 1, metric.WithAttributes(attribute.String(attrTopic, topic)))
 
 	// The original bytes are unreachable — the marshaller failed before

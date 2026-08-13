@@ -291,7 +291,11 @@ func (r *deliveryRecorder) skipped(reason string) {
 // where volume is already spiking, to answer a question the event's own
 // timestamp already answers.
 func (r *deliveryRecorder) retry(attempt int, err error) {
-	r.inst.retries.Add(context.Background(), 1, metric.WithAttributes(
+	// context.Background() carrying r.span, not the delivery's own context
+	// and not a bare Background(): see end() below for why both halves of
+	// that matter.
+	ctx := trace.ContextWithSpan(context.Background(), r.span)
+	r.inst.retries.Add(ctx, 1, metric.WithAttributes(
 		consumeAttrs(r.topic, r.group, r.eventType)...))
 	r.span.AddEvent("retry", trace.WithAttributes(
 		attribute.Int("messaging.foi.immediate_attempt", attempt),
@@ -308,12 +312,24 @@ func (r *deliveryRecorder) end() {
 	}
 	r.ended = true
 
-	// context.Background() deliberately, not the delivery's own context:
-	// metric recording only reads a context for exemplars and cancellation,
-	// and the delivery's own context may be cancelled at the shutdown drain
-	// deadline — recording through a cancelled context would silently drop
-	// the observation for exactly the deliveries most worth counting.
-	ctx := context.Background()
+	// Background(), not the delivery's own context: the delivery's context
+	// may be cancelled at the shutdown drain deadline, and while the SDK's
+	// synchronous Add/Record path (pinned otel/sdk/metric@v1.44.0) never
+	// checks ctx.Err() today, this is defence against a future SDK version
+	// that does, not a fix for a present hazard.
+	//
+	// r.span is threaded through anyway, via trace.ContextWithSpan, because
+	// a context IS read here for something else: sdk/metric's default
+	// exemplarFilter is TraceBasedFilter, which attaches an exemplar to a
+	// data point only when the recording context carries a sampled span.
+	// A bare Background() would make processing.duration, processed,
+	// failed, skipped, and retries — the metrics this branch's whole span
+	// machinery exists to make navigable — the only ones in the library
+	// that can never carry one: dispatch's received/queueLatency, the
+	// dead-letter path's dlq/dlqPublishFailures, and the publisher's
+	// published/publishFailures all already record through their live,
+	// span-carrying ctx.
+	ctx := trace.ContextWithSpan(context.Background(), r.span)
 	elapsed := time.Since(r.start).Seconds()
 	base := consumeAttrs(r.topic, r.group, r.eventType)
 
