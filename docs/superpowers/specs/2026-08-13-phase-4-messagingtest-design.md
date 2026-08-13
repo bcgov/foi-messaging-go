@@ -573,11 +573,23 @@ Guarding the §1 principle:
 
 ## 10. Risks and open implementation questions
 
-1. **Does `internalwatermill.NewPublisher` dial Redis at construction?**
-   If it does, the recording-publisher seam must build the `Publisher`
-   without the Watermill layer rather than swapping `publishFn` on a
-   fully-built one. Everything in §5.1 holds either way; only the seam's
-   internals shift. Verify first.
+1. ~~**Does `internalwatermill.NewPublisher` dial Redis at construction?**~~
+   **Resolved 2026-08-13: it does not.** `redisstream.NewPublisher`
+   (v1.4.5) is struct construction plus config validation — no network call
+   — and `internalredis.NewClient` documents go-redis's lazy connection.
+   Measured against `192.0.2.1:6379` (TEST-NET-1, routed nowhere, so a dial
+   attempt stalls rather than being refused):
+
+   | Call | Result |
+   |---|---|
+   | `NewPublisher` | returned in 315µs, no error — no dial |
+   | `Publish` | stalled the full 3s to the context deadline — the dial happens here |
+   | `Close` | returned in 75µs, nil — safe without a connection |
+
+   So §5.1 stands as written: swap `publishFn` on a fully-built
+   `*messaging.Publisher`, and nothing ever dials, because `publishFn` is
+   the only thing that touches the network. `messagingtest.Publisher.Close`
+   can delegate straight through.
 
 2. **Probe lookups in the production hot path.** Accepted in §4.3, but the
    inline comments must say why, or a later reader will delete them.
