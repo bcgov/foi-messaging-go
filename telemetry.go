@@ -10,6 +10,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/bcgov/foi-messaging-go/internal/testseam"
 )
 
 // telemetryScope is the instrumentation scope every instrument and tracer
@@ -253,9 +255,14 @@ type deliveryRecorder struct {
 	eventType string
 	err       error
 	ended     bool
+
+	// probe is non-nil only when this delivery came from messagingtest.
+	// It is threaded in from dispatch rather than read from a context
+	// here, so the whole delivery costs one lookup rather than two.
+	probe *testseam.Probe
 }
 
-func newDeliveryRecorder(inst *instruments, span trace.Span, topic, group string, log *slog.Logger) *deliveryRecorder {
+func newDeliveryRecorder(inst *instruments, span trace.Span, topic, group string, log *slog.Logger, probe *testseam.Probe) *deliveryRecorder {
 	return &deliveryRecorder{
 		inst:  inst,
 		span:  span,
@@ -263,6 +270,7 @@ func newDeliveryRecorder(inst *instruments, span trace.Span, topic, group string
 		topic: topic,
 		group: group,
 		start: time.Now(),
+		probe: probe,
 	}
 }
 
@@ -311,6 +319,22 @@ func (r *deliveryRecorder) end() {
 		return
 	}
 	r.ended = true
+
+	// The verdict messagingtest reads. Copied here rather than derived
+	// anywhere else because this is the one place that already holds it —
+	// the same state the metrics below are built from, which is what makes
+	// a probe incapable of reporting an outcome production would not have.
+	//
+	// The position is load-bearing on both sides: after r.ended = true so
+	// the idempotence guard still wins, and before the switch below, whose
+	// default branch overwrites r.category with categoryUnknown on the
+	// handler-panic path.
+	if r.probe != nil {
+		r.probe.Kind = kindName(r.kind)
+		r.probe.Category = r.category
+		r.probe.Reason = r.reason
+		r.probe.Err = r.err
+	}
 
 	// Background(), not the delivery's own context: the delivery's context
 	// may be cancelled at the shutdown drain deadline, and while the SDK's
@@ -378,6 +402,21 @@ func (r *deliveryRecorder) end() {
 	}
 
 	r.span.End()
+}
+
+// kindName maps an outcomeKind to the string testseam compares against.
+// The default is deliberately KindFailed rather than an empty string: an
+// unstated outcome is the handler-panic path, which end() itself records
+// as a failure.
+func kindName(k outcomeKind) string {
+	switch k {
+	case outcomeProcessed:
+		return testseam.KindProcessed
+	case outcomeSkipped:
+		return testseam.KindSkipped
+	default:
+		return testseam.KindFailed
+	}
 }
 
 func (r *deliveryRecorder) recordFailure(ctx context.Context, base []attribute.KeyValue) {

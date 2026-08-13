@@ -307,7 +307,7 @@ func TestDeliveryRecorder_TerminalInvariant(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mp, reader := newTestMeterProvider(t)
 			inst := newInstruments(mp, slog.Default())
-			r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default())
+			r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default(), nil)
 
 			tt.act(r)
 			r.end()
@@ -336,7 +336,7 @@ func TestDeliveryRecorder_EndIsIdempotent(t *testing.T) {
 	// early; a double end would double-count every delivery.
 	mp, reader := newTestMeterProvider(t)
 	inst := newInstruments(mp, slog.Default())
-	r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default())
+	r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default(), nil)
 
 	r.processed()
 	r.end()
@@ -358,7 +358,7 @@ func TestDeliveryRecorder_SetEventTypeAttributesTheOutcome(t *testing.T) {
 	// rather than being tracked and silently dropped at end().
 	mp, reader := newTestMeterProvider(t)
 	inst := newInstruments(mp, slog.Default())
-	r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default())
+	r := newDeliveryRecorder(inst, tracenoop.Span{}, "documents", "billing", slog.Default(), nil)
 
 	r.setEventType("document.filed.v1")
 	r.processed()
