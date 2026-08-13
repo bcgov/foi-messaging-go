@@ -165,6 +165,14 @@ deserialization failure indistinguishable in the one metric operators page on.
 `max_attempts`. The first two come from the PRD §15 classification predicates;
 the last two name failures that never reach a handler.
 
+**Exception:** a stream entry Watermill's own marshaller cannot read at all
+never reaches `dispatch`. It increments `events.received` and `messaging.dlq`
+and *none* of `processed`/`failed`/`skipped`, and never records
+`processing.duration` — there is no envelope to attribute a terminal outcome
+or a duration to. An operator alerting on `rate(events.failed)` alone will not
+catch a producer that starts writing corrupt entries; `messaging.dlq` must be
+watched too.
+
 This invariant is testable — see §5 — and should be tested rather than
 asserted in a comment.
 
@@ -531,3 +539,66 @@ unimplemented behaviour:
   become direct requires. Acceptable — they are the canonical test doubles for
   the API the library instruments against, and there is no lighter way to
   assert a histogram observation.
+
+---
+
+## 10. Found during implementation
+
+Carried back per the repository convention. Each of these was a defect in *this
+document* or in the plan derived from it, not in the code that implemented them.
+
+- **`propagation.TraceContext{}.Fields()` returns two fields, not one**
+  (`traceparent` and `tracestate`). §3's reasoning is unaffected, but a test
+  asserting a single field would have been wrong.
+- **`RegisterRawHandler` defeats the §2 cardinality bound.** `registry.lookup`
+  returns a raw handler for every event on its topic, so a successful lookup
+  does not imply a bounded `event_type`. `lookup` now reports a `routeMatch`,
+  and only `matchTyped` licenses the attribute. Folded into §2 before
+  implementation began.
+- **The `unused` linter rejects scaffolding.** §1 puts all telemetry constants
+  in `telemetry.go`, but nothing consumes them until later tasks and
+  `.golangci.yml` enables `unused`. Resolved with a label-contract test pinning
+  the literal values — which earns its place independently: these strings are
+  the metric *label* contract exactly as the instrument names are the *name*
+  contract.
+- **The example module cannot guard against renames.** §6's
+  `examples/telemetry` is a separate Go module (so `client_golang` stays out of
+  the library's `go.mod`), and therefore holds a *copy* of the instrument
+  names. Renaming an instrument does not fail its test. The rename guard is
+  `TestNewInstruments_CreatesEveryInstrument` in the root module; the example
+  guards the OTel→Prometheus name translation. Both lists must move together
+  and both files say so.
+- **Recording through `context.Background()` disables exemplars.** The
+  recorder originally used a bare `Background()` on the stated grounds that a
+  cancelled context would drop the observation. That premise is false — the
+  SDK's synchronous recording path never checks `ctx.Err()`. The real
+  consequence was that `processing.duration`, `processed`, `failed`, `skipped`
+  and `retries` could never carry a trace exemplar, while every other recording
+  site could. Now `trace.ContextWithSpan(context.Background(), r.span)`, which
+  keeps the cancellation immunity and restores exemplars.
+
+  This also means §"Out of scope"'s dismissal of exemplars was wrong: the OTel
+  SDK enables `TraceBasedFilter` by default, so exemplars need no
+  application-side opt-in and were silently being suppressed.
+- **`processing.duration` includes the dead-letter write**, because the
+  deferred recorder ends after `deadLetter` returns. Decided deliberately: the
+  DLQ write genuinely occupies the delivery's concurrency slot. A DLQ outage
+  therefore shows as a p99 latency spike *and* in
+  `messaging_dlq_publish_failures_total`; the README says so.
+- **The terminal invariant has one exception.** The undecodable-entry path
+  increments `received` and `dlq` and no terminal counter — it never reaches
+  `dispatch`. §2 and the README now state it.
+- **A pre-existing Phase 2b test never reached its branch.** The test for
+  unparseable schema versions used `-1.0.0`, which `validateEnvelope` rejects
+  one check earlier, so `majorVersion`'s error branch had never been exercised.
+  A case using an integer-overflowing major now reaches it.
+
+### Review coverage
+
+Tasks 1–7 each received an independent per-task review. An account spend limit
+then interrupted the process, and Tasks 8–14 were implemented and self-reviewed
+by the same agent. The final whole-branch review — the first independent look at
+those six commits — found five substantive defects in them, including the
+exemplar bug above and two coverage gaps proven by mutation. All were fixed and
+re-reviewed. The episode is worth recording because it is direct evidence for
+what the per-task review loop buys: self-review caught none of the five.

@@ -5,12 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
 	internalwatermill "github.com/bcgov/foi-messaging-go/internal/watermill"
@@ -38,6 +43,13 @@ type Consumer struct {
 	dlq deadLetterSink
 
 	reader *internalredis.StreamReader
+
+	// inst and tracer are built once by NewConsumer, not by Run: dispatch
+	// is reachable without Run (tests, and the failure paths that are
+	// hardest to provoke against a live broker), and a nil instrument set
+	// there would panic rather than simply not record.
+	inst   *instruments
+	tracer trace.Tracer
 }
 
 // NewConsumer validates cfg and returns a Consumer with no handlers
@@ -51,7 +63,12 @@ func NewConsumer(cfg Config) (*Consumer, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	return &Consumer{cfg: cfg, registry: newRegistry()}, nil
+	return &Consumer{
+		cfg:      cfg,
+		registry: newRegistry(),
+		inst:     newInstruments(cfg.Telemetry.MeterProvider, cfg.Telemetry.Logger),
+		tracer:   cfg.Telemetry.TracerProvider.Tracer(telemetryScope),
+	}, nil
 }
 
 // RegisterHandler registers a typed handler for def. It is a function
@@ -200,39 +217,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		ClaimMinIdle:  c.cfg.Consumer.ClaimMinIdle,
 		Logger:        c.cfg.Telemetry.Logger,
 		OnUndecodable: func(stream, entryID string, fields map[string]any) error {
-			topic, ok := topicByStream[stream]
-			if !ok {
-				return fmt.Errorf("no topic registered for stream %q", stream)
-			}
-
-			// The original bytes are unreachable — the marshaller failed
-			// before producing a payload — so the raw Redis fields are what
-			// gets preserved. PRD §14 did not anticipate a
-			// marshaller-level failure; this is the nearest thing to
-			// "the raw bytes" that exists at this point.
-			raw, err := json.Marshal(fields)
-			if err != nil {
-				return fmt.Errorf("marshalling fields of undecodable entry %q: %w", entryID, err)
-			}
-
-			dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
-				fmt.Errorf("stream entry %q could not be unmarshalled", entryID), 1)
-			dl.EventRaw = raw
-
-			// Detached from Run's ctx, and timeout-bounded, for the same
-			// reason the subscriber's ack path is: an entry reaching this
-			// hook during the drain must still be recorded, and Run's ctx
-			// is already cancelled by then. Without this the DLQ write
-			// fails with context.Canceled at exactly the moment there is a
-			// backlog to clear.
-			//
-			// The same reasoning does not apply to the DLQ writes inside
-			// dispatch: those run on the message context, which is already
-			// context.WithoutCancel-derived and stays live for the whole
-			// drain.
-			dlqCtx, cancelDLQ := context.WithTimeout(context.WithoutCancel(ctx), dlqPublishTimeout)
-			defer cancelDLQ()
-			return c.deadLetter(dlqCtx, topic, dl)
+			return c.handleUndecodable(ctx, topicByStream, stream, entryID, fields)
 		},
 	})
 	if err != nil {
@@ -282,6 +267,65 @@ func (c *Consumer) Run(ctx context.Context) error {
 	return errors.Join(runErr, closeErr, subCloseErr, readerErr)
 }
 
+// handleUndecodable records and dead-letters a stream entry that Watermill's
+// marshaller could not read at all.
+//
+// It is a method rather than the inline closure it began as so its metrics
+// and its DLQ routing are reachable from a unit test: provoking a
+// marshaller-level failure against a live broker means writing a
+// deliberately corrupt entry, which is a lot of setup for a path that is
+// pure error handling.
+//
+// runCtx is Run's context, used only as the parent to detach from.
+func (c *Consumer) handleUndecodable(runCtx context.Context, topicByStream map[string]string, stream, entryID string, fields map[string]any) error {
+	topic, ok := topicByStream[stream]
+	if !ok {
+		return fmt.Errorf("no topic registered for stream %q", stream)
+	}
+
+	// Counted here and nowhere else: an entry the marshaller cannot read
+	// never reaches dispatch, so without this messaging_dlq_total would
+	// exceed messaging_events_received_total on this path — an invariant
+	// violation that reads as a metrics bug and hides the real one
+	// underneath it.
+	//
+	// Recorded through runCtx directly rather than deliveryRecorder's
+	// Background()-plus-span pattern (telemetry.go end()/retry()): a
+	// marshaller failure happens before dispatch ever runs, so there is no
+	// delivery span here to give an exemplar reservoir anything to attach
+	// to, and it is undecodable specifically because the entry never
+	// became a message dispatch could open one for. runCtx's cancellation
+	// at drain is not a hazard either way — see the comment on
+	// deliveryRecorder.end for why.
+	c.inst.received.Add(runCtx, 1, metric.WithAttributes(attribute.String(attrTopic, topic)))
+
+	// The original bytes are unreachable — the marshaller failed before
+	// producing a payload — so the raw Redis fields are what gets
+	// preserved. PRD §14 did not anticipate a marshaller-level failure;
+	// this is the nearest thing to "the raw bytes" that exists here.
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return fmt.Errorf("marshalling fields of undecodable entry %q: %w", entryID, err)
+	}
+
+	dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
+		fmt.Errorf("stream entry %q could not be unmarshalled", entryID), 1)
+	dl.EventRaw = raw
+
+	// Detached from Run's ctx, and timeout-bounded, for the same reason
+	// the subscriber's ack path is: an entry reaching this hook during the
+	// drain must still be recorded, and Run's ctx is already cancelled by
+	// then. Without this the DLQ write fails with context.Canceled at
+	// exactly the moment there is a backlog to clear.
+	//
+	// The same reasoning does not apply to the DLQ writes inside dispatch:
+	// those run on the message context, which is already
+	// context.WithoutCancel-derived and stays live for the whole drain.
+	dlqCtx, cancelDLQ := context.WithTimeout(context.WithoutCancel(runCtx), dlqPublishTimeout)
+	defer cancelDLQ()
+	return c.deadLetter(dlqCtx, topic, dl)
+}
+
 // closeReader closes reader and clears it from Consumer state so a later
 // Close call sees nothing to close. This is the single call site Run uses
 // to close its reader — on every exit path, not just the normal-teardown
@@ -315,13 +359,91 @@ func (c *Consumer) closeReader(reader *internalredis.StreamReader) error {
 // slot — proving what its counter already said; then the three
 // deserialization failures dead-letter rather than nack, being permanent by
 // definition; then runWithRetry runs the handler.
+//
+// Telemetry is stated, not recorded, at each of dispatch's six return
+// statements — one of which delegates to runWithRetry's own five
+// outcome-stating branches, for ten call sites in total across the two
+// functions: each calls one rec.processed/failed/skipped and the single
+// deferred rec.end() below turns that into the span status, the duration
+// observation, and exactly one terminal counter. Instrumenting each site in
+// place would thread twenty-odd statements through the subtlest function in
+// the repository and make every exit path added later a chance to forget
+// one.
 func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, metadata map[string]string) error {
+	// Extracted before the span opens so the consumer span parents to the
+	// producer's (PRD §5). A message with no traceparent simply starts a
+	// new trace here.
+	ctx = c.cfg.Telemetry.Propagator.Extract(ctx, propagation.MapCarrier(metadata))
+
+	stream := c.streamName(topic)
+	ctx, span := c.tracer.Start(ctx, "process "+topic,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "redis"),
+			attribute.String("messaging.operation.name", "process"),
+			attribute.String("messaging.destination.name", stream),
+			attribute.String("messaging.consumer.group.name", c.cfg.Consumer.Group),
+			attribute.String("messaging.foi.stream_id", metadata[internalwatermill.MetadataStreamID]),
+		))
+
+	rec := newDeliveryRecorder(c.inst, span, topic, c.cfg.Consumer.Group, c.cfg.Telemetry.Logger)
+	// The only thing guaranteeing the span is closed when a handler is
+	// abandoned at the drain deadline: message contexts are
+	// context.WithoutCancel-derived and stay live for the whole
+	// ShutdownTimeout, so nothing else will end it.
+	defer rec.end()
+
+	c.inst.received.Add(ctx, 1, metric.WithAttributes(attribute.String(attrTopic, topic)))
+
+	// Publish-to-dispatch latency, which is the only thing that separates
+	// "our handlers are slow" from "we are behind on the stream" —
+	// processing.duration cannot tell those apart because it starts here.
+	//
+	// A missing or unparseable published_at skips the observation and
+	// nothing else: transport metadata that arrived odd is not a reason to
+	// fail a message.
+	if publishedAt, ok := parsePublishedAt(metadata); ok {
+		// published_at is stamped by the publishing host and read by this
+		// one, so this measures elapsed time plus clock skew. A publisher
+		// running ahead yields a negative value, which is clamped rather
+		// than recorded: the delivery did happen, and a negative latency
+		// bucket is nonsense. The skew caveat is documented for operators
+		// rather than corrected for here — there is nothing to correct it
+		// against.
+		latency := time.Since(publishedAt).Seconds()
+		if latency < 0 {
+			latency = 0
+		}
+		c.inst.queueLatency.Record(ctx, latency, metric.WithAttributes(
+			attribute.String(attrTopic, topic)))
+	}
+
+	// trace_id and span_id are what make a log line and a trace navigable
+	// from each other. PRD §16's field list does not name them; reconciling
+	// the rest of that list is out of scope for Phase 3.
+	sc := span.SpanContext()
 	log := c.cfg.Telemetry.Logger.With(
 		"stream_id", metadata[internalwatermill.MetadataStreamID],
 		"delivery_attempt", metadata[internalwatermill.MetadataDeliveryAttempt],
+		"trace_id", sc.TraceID().String(),
+		"span_id", sc.SpanID().String(),
 	)
 
+	// PRD §16: payload contents are not logged by default. When enabled
+	// they attach to this delivery's base logger, so they ride every line
+	// built from it below — the no-handler Debug, the cap-exceeded and
+	// discard Warns, the retry Debug in runWithRetry, and the various
+	// error lines — not error lines alone. They never appear in span
+	// attributes or metric attributes, whatever this is set to, because
+	// spans and metrics routinely leave the trust boundary that logs stay
+	// inside.
+	if c.cfg.Telemetry.LogPayloads {
+		log = log.With("payload", string(payload))
+	}
+
 	attempt := deliveryAttempt(metadata)
+	span.SetAttributes(attribute.Int64("messaging.foi.delivery_attempt", attempt))
+
 	if attempt > int64(c.cfg.Consumer.MaxDeliveryAttempts) {
 		// Checked before decoding, and before any classification is
 		// consulted — PRD §13 Layer 3 caps regardless of classification.
@@ -336,10 +458,11 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 		log.Warn("messaging: delivery attempt cap exceeded",
 			"topic", topic, "max_delivery_attempts", c.cfg.Consumer.MaxDeliveryAttempts)
 
-		dl := c.newDeadLetter(topic, ReasonMaxAttemptsExceeded,
-			fmt.Errorf("delivery attempt %d exceeded MaxDeliveryAttempts %d",
-				attempt, c.cfg.Consumer.MaxDeliveryAttempts),
-			attempt)
+		err := fmt.Errorf("delivery attempt %d exceeded MaxDeliveryAttempts %d",
+			attempt, c.cfg.Consumer.MaxDeliveryAttempts)
+		rec.failed(categoryMaxAttempts, err)
+
+		dl := c.newDeadLetter(topic, ReasonMaxAttemptsExceeded, err, attempt)
 		dl.Event, dl.EventRaw = deadLetterBody(payload)
 		return c.deadLetter(ctx, topic, dl)
 	}
@@ -359,15 +482,30 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 		// PRD §14 puts everything that failed to deserialize into a usable
 		// event in event_raw, including a syntactically valid envelope
 		// that failed validation.
+		rec.failed(categoryDeserialization, err)
+
 		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
 			fmt.Errorf("unmarshalling envelope on topic %q: %w", topic, err), attempt)
 		dl.EventRaw = payload
 		return c.deadLetter(ctx, topic, dl)
 	}
 
+	// Set on the span, never on the metric attributes at this point: the
+	// event type here is whatever the wire said, and only a typed registry
+	// match downstream proves it came from a bounded set. Spans are not
+	// aggregated by attribute value, so they carry it unconditionally.
+	span.SetAttributes(
+		attribute.String("messaging.message.id", env.EventID),
+		attribute.String("messaging.foi.event_type", env.EventType),
+		attribute.String("messaging.foi.schema_version", env.SchemaVersion),
+		attribute.String("messaging.foi.correlation_id", env.CorrelationID),
+	)
+
 	if err := validateEnvelope(env); err != nil {
 		log.Error("messaging: invalid event envelope",
 			"topic", topic, "event_id", env.EventID, "error", err)
+		rec.failed(categoryDeserialization, err)
+
 		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
 			fmt.Errorf("validating envelope on topic %q: %w", topic, err), attempt)
 		dl.EventRaw = payload
@@ -378,6 +516,8 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	if err != nil {
 		log.Error("messaging: unparseable schema version",
 			"topic", topic, "event_id", env.EventID, "error", err)
+		rec.failed(categoryDeserialization, err)
+
 		dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
 			fmt.Errorf("parsing schema version on topic %q: %w", topic, err), attempt)
 		dl.EventRaw = payload
@@ -385,21 +525,28 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	}
 
 	c.mu.Lock()
-	handler, ok := c.registry.lookup(topic, env.EventType, major)
+	handler, match := c.registry.lookup(topic, env.EventType, major)
 	c.mu.Unlock()
 
-	if !ok {
+	if match == matchNone {
 		// Topics are shared and services consume only the event types they
 		// care about, so an unmatched event is a normal outcome, not a
-		// failure. Phase 3 counts these as skipped{reason="no_handler"}.
+		// failure. It counts as skipped{reason="no_handler"}.
 		log.Debug("messaging: no handler for event",
 			"topic", topic, "event_type", env.EventType,
 			"schema_version", env.SchemaVersion, "event_id", env.EventID)
+		rec.skipped(reasonNoHandler)
 		return nil
 	}
 
+	// Only a typed match proves the event type came from a bounded set
+	// fixed at registration; a raw handler takes whatever the wire said.
+	if match == matchTyped {
+		rec.setEventType(env.EventType)
+	}
+
 	ctx = contextWithCorrelationID(ctx, env.CorrelationID)
-	return c.runWithRetry(ctx, topic, payload, attempt, handler, env)
+	return c.runWithRetry(ctx, topic, payload, attempt, handler, env, rec, log)
 }
 
 // streamName maps a logical topic to its Redis stream.
@@ -502,12 +649,21 @@ func (c *Consumer) deadLetter(ctx context.Context, topic string, dl DeadLetter) 
 		return fmt.Errorf("marshalling dead letter for %q: %w", stream, err)
 	}
 
+	// event_type is deliberately absent: the DLQ paths include
+	// deserialization failures where no bounded event type exists, and a
+	// metric whose attribute set changes shape by reason is harder to query
+	// than one that never carries it.
+	attrs := consumeAttrs(topic, c.cfg.Consumer.Group, "", attribute.String(attrReason, dl.Reason))
+
 	if err := sink.publish(ctx, stream, body); err != nil {
+		c.inst.dlqPublishFailures.Add(ctx, 1, metric.WithAttributes(attrs...))
 		c.cfg.Telemetry.Logger.Error("messaging: dead letter publish failed",
 			"topic", topic, "dlq_stream", stream, "reason", dl.Reason,
 			"delivery_attempts", dl.DeliveryAttempts, "error", err)
 		return fmt.Errorf("publishing dead letter to %q: %w", stream, err)
 	}
+
+	c.inst.dlq.Add(ctx, 1, metric.WithAttributes(attrs...))
 
 	// Warn, not Info: a dead letter is an event no handler will ever
 	// process, and it needs to be visible without turning on debug logging.
@@ -542,6 +698,12 @@ func deliveryAttempt(metadata map[string]string) int64 {
 // sleep would let a later message overtake the retrying one, and per-topic
 // ordering at Concurrency 1 is a documented guarantee (PRD §6). The bound
 // being per topic is what keeps the stall from reaching other topics.
+//
+// rec is dispatch's recorder rather than one of this loop's own: the whole
+// loop is one delivery, so each of its five outcome-stating branches
+// (success, discard, permanent failure, retries exhausted, and abandoned
+// mid-backoff) states the outcome for the delivery dispatch already opened
+// a span and started a timer for.
 func (c *Consumer) runWithRetry(
 	ctx context.Context,
 	topic string,
@@ -549,8 +711,13 @@ func (c *Consumer) runWithRetry(
 	attempt int64,
 	handler dispatchFunc,
 	env Envelope[json.RawMessage],
+	rec *deliveryRecorder,
+	log *slog.Logger,
 ) error {
-	log := c.cfg.Telemetry.Logger.With(
+	// Extends dispatch's logger rather than starting from the config one,
+	// so the trace correlation fields and any gated payload survive into
+	// the retry loop's lines.
+	log = log.With(
 		"topic", topic, "event_type", env.EventType,
 		"schema_version", env.SchemaVersion, "event_id", env.EventID,
 		"delivery_attempt", attempt,
@@ -565,14 +732,17 @@ func (c *Consumer) runWithRetry(
 		// the one that should apply.
 		switch {
 		case err == nil:
+			rec.processed()
 			return nil
 
 		case IsDiscard(err):
 			log.Warn("messaging: handler discarded event", "error", err)
+			rec.skipped(reasonDiscard)
 			return nil
 
 		case IsPermanent(err):
 			log.Error("messaging: handler returned a permanent error", "error", err)
+			rec.failed(categoryPermanent, err)
 			dl := c.newDeadLetter(topic, ReasonPermanent, err, attempt)
 			dl.Event, dl.EventRaw = deadLetterBody(payload)
 			return c.deadLetter(ctx, topic, dl)
@@ -584,12 +754,15 @@ func (c *Consumer) runWithRetry(
 			// redelivers it with its counter advanced.
 			log.Error("messaging: handler returned error, immediate retries exhausted",
 				"immediate_attempts", i+1, "error", err)
+			rec.failed(categoryRetryable, err)
 			return err
 		}
 
 		log.Debug("messaging: retrying handler", "immediate_attempt", i+1, "error", err)
+		rec.retry(i+1, err)
 		if !sleepWithJitter(ctx, backoffUpperBound(c.cfg.Retry, i)) {
 			// Abandoned mid-backoff. Nack so the entry survives.
+			rec.failed(categoryRetryable, err)
 			return err
 		}
 	}

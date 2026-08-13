@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	messaging "github.com/bcgov/foi-messaging-go"
 	"github.com/bcgov/foi-messaging-go/internal/testsupport"
 )
@@ -1111,5 +1114,88 @@ func TestConsumer_UndecodableStreamEntryReachesTheDLQ(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+}
+
+// TestConsumer_PropagatesTraceContextFromPublisher is the one assertion that
+// covers the whole propagation chain at once: injection at publish, the
+// metadata surviving Watermill's marshaller and the Redis round trip, and
+// extraction at consume. Each half can pass its own unit test while the
+// chain is broken in the middle — a metadata key that never reaches Redis,
+// or a propagator configured on only one side, looks identical to working
+// code from either end.
+func TestConsumer_PropagatesTraceContextFromPublisher(t *testing.T) {
+	cfg := consumeFixture(t)
+
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	cfg.Telemetry.TracerProvider = tp
+
+	consumer, err := messaging.NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+
+	publisher, err := messaging.NewPublisher(cfg)
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	defer publisher.Close()
+
+	handler := newCollectingHandler(0)
+	if err := messaging.RegisterHandler(consumer, documentCreated, handler); err != nil {
+		t.Fatalf("RegisterHandler: %v", err)
+	}
+	stop := runConsumer(t, consumer)
+
+	// Published inside a span of our own, so the producer span has a known
+	// non-root parent and a trace id we can compare against rather than
+	// merely asserting the two spans share "some" trace.
+	pubCtx, root := tp.Tracer("test").Start(context.Background(), "root")
+	if _, err := publisher.Publish(pubCtx, documentCreated,
+		documentCreatedPayload{EntityID: "e1", Name: "report.pdf"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	root.End()
+
+	select {
+	case <-handler.notify:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the handler to receive the event")
+	}
+
+	// Stop before reading spans: the consumer span is ended by dispatch's
+	// deferred recorder, and the recorder only sees it once it has ended.
+	stop()
+
+	var producer, consumerSpan sdktrace.ReadOnlySpan
+	for _, s := range recorder.Ended() {
+		switch s.Name() {
+		case "publish documents":
+			producer = s
+		case "process documents":
+			consumerSpan = s
+		}
+	}
+	if producer == nil {
+		t.Fatal("no producer span was recorded")
+	}
+	if consumerSpan == nil {
+		t.Fatal("no consumer span was recorded")
+	}
+
+	if got, want := consumerSpan.Parent().TraceID(), producer.SpanContext().TraceID(); got != want {
+		t.Errorf("consumer span trace id = %s, want the producer's %s", got, want)
+	}
+	if got, want := consumerSpan.Parent().SpanID(), producer.SpanContext().SpanID(); got != want {
+		t.Errorf("consumer span parent = %s, want the producer span %s", got, want)
+	}
+	if !consumerSpan.Parent().IsRemote() {
+		t.Error("consumer span parent is not marked remote; the trace context did not travel through Redis")
+	}
+	// The producer span must itself be a child of our root, proving the
+	// publish path did not start a fresh trace.
+	if got, want := producer.SpanContext().TraceID(), root.SpanContext().TraceID(); got != want {
+		t.Errorf("producer span trace id = %s, want the caller's root trace %s", got, want)
 	}
 }

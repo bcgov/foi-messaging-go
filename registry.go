@@ -73,14 +73,33 @@ func (r *registry) addRaw(topic string, fn dispatchFunc) error {
 	return nil
 }
 
-// lookup resolves an event to its handler. A raw handler, when present,
-// takes every event on its topic.
-func (r *registry) lookup(topic, eventType string, major int) (dispatchFunc, bool) {
+// routeMatch says how an event matched a handler.
+//
+// It exists for telemetry, not for dispatch, which treats both matches
+// identically. A typed match means the event type came from a set fixed at
+// registration time and is safe to use as a metric attribute; a raw match
+// means it is whatever the wire said, and a raw handler takes every event
+// on its topic — so a successful lookup alone is not evidence of a bounded
+// event type. Attaching one as a label would let any producer mint
+// unbounded series.
+type routeMatch int
+
+const (
+	matchNone routeMatch = iota
+	matchTyped
+	matchRaw
+)
+
+// lookup resolves an event to its handler, reporting how it matched. A raw
+// handler, when present, takes every event on its topic.
+func (r *registry) lookup(topic, eventType string, major int) (dispatchFunc, routeMatch) {
 	if fn, ok := r.raw[topic]; ok {
-		return fn, true
+		return fn, matchRaw
 	}
-	fn, ok := r.typed[routeKey{topic: topic, eventType: eventType, major: major}]
-	return fn, ok
+	if fn, ok := r.typed[routeKey{topic: topic, eventType: eventType, major: major}]; ok {
+		return fn, matchTyped
+	}
+	return nil, matchNone
 }
 
 // topicList returns the distinct topics to subscribe to.

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/propagation"
 )
 
 func TestConfigValidate_RequiredFields(t *testing.T) {
@@ -365,5 +367,65 @@ func TestValidate_RejectsNegativeRetryFields(t *testing.T) {
 				t.Errorf("error should name %s, got %q", tc.field, err)
 			}
 		})
+	}
+}
+
+func TestConfig_Validate_DefaultsPropagatorToTraceContext(t *testing.T) {
+	// Defaulted directly rather than from otel.GetTextMapPropagator(),
+	// which is a no-op until the application sets it. A no-op default
+	// fails silently, so it gets an explicit test.
+	cfg := Config{Source: "svc", Redis: RedisConfig{Address: "localhost:6379"}}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+
+	if cfg.Telemetry.Propagator == nil {
+		t.Fatal("Telemetry.Propagator = nil, want a default")
+	}
+
+	fields := cfg.Telemetry.Propagator.Fields()
+	if len(fields) == 0 {
+		t.Fatal("Propagator.Fields() = empty, want at least traceparent")
+	}
+	// TraceContext includes traceparent and tracestate from W3C Trace Context spec
+	found := false
+	for _, f := range fields {
+		if f == "traceparent" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Propagator.Fields() = %v, want to contain traceparent", fields)
+	}
+}
+
+func TestConfig_Validate_KeepsSuppliedPropagator(t *testing.T) {
+	custom := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
+	cfg := Config{
+		Source:    "svc",
+		Redis:     RedisConfig{Address: "localhost:6379"},
+		Telemetry: TelemetryConfig{Propagator: custom},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+
+	fields := cfg.Telemetry.Propagator.Fields()
+	// Composite propagator should have fields from both TraceContext and Baggage
+	foundTraceparent := false
+	foundBaggage := false
+	for _, f := range fields {
+		if f == "traceparent" {
+			foundTraceparent = true
+		}
+		if f == "baggage" {
+			foundBaggage = true
+		}
+	}
+	if !foundTraceparent || !foundBaggage {
+		t.Fatalf("Propagator.Fields() = %v, want both traceparent and baggage", fields)
 	}
 }

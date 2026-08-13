@@ -1,15 +1,24 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	internalredis "github.com/bcgov/foi-messaging-go/internal/redis"
+	internalwatermill "github.com/bcgov/foi-messaging-go/internal/watermill"
 )
 
 func testConsumerConfig() Config {
@@ -884,5 +893,760 @@ func TestDispatch_CapDeadLettersBeforeDecoding(t *testing.T) {
 	}
 	if got.DeliveryAttempts != 9 {
 		t.Errorf("DeliveryAttempts = %d, want 9", got.DeliveryAttempts)
+	}
+}
+
+// newTestConsumerWithTelemetry builds a Consumer wired to mp, reusing the
+// existing testConsumerConfig() so these tests stay in step with the rest
+// of the suite's defaults. dispatch is reachable without Run, which is
+// what makes the failure paths testable at all.
+func newTestConsumerWithTelemetry(t *testing.T, mp metric.MeterProvider) *Consumer {
+	t.Helper()
+
+	cfg := testConsumerConfig()
+	cfg.Telemetry.MeterProvider = mp
+
+	c, err := NewConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewConsumer() = %v, want nil", err)
+	}
+	return c
+}
+
+func TestDispatch_TerminalInvariantAcrossExitPaths(t *testing.T) {
+	// Spec §2's invariant, asserted against the real dispatch rather than
+	// the recorder in isolation: every exit path must record exactly one
+	// terminal counter and exactly one duration observation.
+	terminal := []string{
+		"messaging.events.processed",
+		"messaging.events.failed",
+		"messaging.events.skipped",
+	}
+
+	envelopeWith := func(mut func(*Envelope[json.RawMessage])) []byte {
+		env := Envelope[json.RawMessage]{
+			EventID:       "018f2e7a-1c6b-7c0a-9f8d-3e4a2b1c5d90",
+			EventType:     "document.created",
+			Timestamp:     time.Now().UTC(),
+			SchemaVersion: "1.0.0",
+			CorrelationID: "corr-1",
+			Source:        "test",
+			Payload:       json.RawMessage(`{}`),
+		}
+		mut(&env)
+		b, err := json.Marshal(env)
+		if err != nil {
+			t.Fatalf("marshalling test envelope: %v", err)
+		}
+		return b
+	}
+
+	validEnvelope := func(eventType string) []byte {
+		return envelopeWith(func(e *Envelope[json.RawMessage]) { e.EventType = eventType })
+	}
+
+	tests := []struct {
+		name     string
+		payload  []byte
+		metadata map[string]string
+		handler  func(context.Context, Envelope[json.RawMessage]) error
+		register bool
+		want     string
+
+		// retryConfig overrides c.cfg.Retry when non-nil. Only the two
+		// retryable rows need this: they must reach runWithRetry's two
+		// categoryRetryable sites (consumer.go:745, :753) without the
+		// test actually waiting out a real backoff.
+		retryConfig *RetryConfig
+
+		// cancelBeforeDispatch dispatches with an already-cancelled
+		// context, so sleepWithJitter abandons the retry mid-backoff
+		// (consumer.go:753) instead of exhausting the immediate-retry
+		// count (consumer.go:745).
+		cancelBeforeDispatch bool
+
+		// wantLabel and wantLabelValue pin the series, not merely the
+		// counter. error_category and reason are the dimensions
+		// operators cut alerts on, so a terminal counter firing with
+		// the wrong label value is a silent, high-consequence defect —
+		// and asserting only on the counter name cannot see it.
+		wantLabel      string
+		wantLabelValue string
+
+		// wantEventType is the value the terminal series must carry on
+		// event_type, or "" when it must carry none. Both halves of the
+		// cardinality rule are asserted here: a typed match attaches it
+		// (dashboards are cut by it), and every other path must not
+		// (the wire value is attacker-influenced and unbounded).
+		wantEventType string
+	}{
+		{
+			name:     "processed",
+			payload:  validEnvelope("document.created"),
+			handler:  func(context.Context, Envelope[json.RawMessage]) error { return nil },
+			register: true,
+			want:     "messaging.events.processed",
+			// The positive half of the cardinality rule. Without this
+			// the setEventType call in dispatch can be deleted outright
+			// and nothing fails, while every consume dashboard silently
+			// loses its event_type dimension.
+			wantEventType: "document.created",
+		},
+		{
+			name:           "no handler",
+			payload:        validEnvelope("document.created"),
+			register:       false,
+			want:           "messaging.events.skipped",
+			wantLabel:      attrReason,
+			wantLabelValue: reasonNoHandler,
+		},
+		{
+			name:           "discard",
+			payload:        validEnvelope("document.created"),
+			handler:        func(context.Context, Envelope[json.RawMessage]) error { return AsDiscard(errors.New("nope")) },
+			register:       true,
+			want:           "messaging.events.skipped",
+			wantLabel:      attrReason,
+			wantLabelValue: reasonDiscard,
+			// A skip is not attributed by event type even on a typed
+			// match: deliveryRecorder.end drops it from the skipped
+			// series deliberately.
+			wantEventType: "",
+		},
+		{
+			name:           "permanent",
+			payload:        validEnvelope("document.created"),
+			handler:        func(context.Context, Envelope[json.RawMessage]) error { return AsPermanent(errors.New("bad")) },
+			register:       true,
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryPermanent,
+			wantEventType:  "document.created",
+		},
+		{
+			// The other of the two error_category="retryable" exits
+			// (consumer.go:745). Without a row for it, replacing the
+			// category argument at either call site with categoryPermanent
+			// leaves this table fully green — the highest-volume failure
+			// category in production, driving redelivery/DLQ alerting,
+			// would go unasserted.
+			name:           "retries exhausted",
+			payload:        validEnvelope("document.created"),
+			handler:        func(context.Context, Envelope[json.RawMessage]) error { return errBoom },
+			register:       true,
+			retryConfig:    &RetryConfig{MaxImmediateRetries: 1, InitialBackoff: time.Nanosecond, MaxBackoff: time.Nanosecond},
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryRetryable,
+			wantEventType:  "document.created",
+		},
+		{
+			// consumer.go:753: the loop still had immediate retries left,
+			// but sleepWithJitter's ctx was cancelled mid-backoff (e.g. the
+			// shutdown drain deadline). This is a distinct call site from
+			// "retries exhausted" above — reachable only when the retry
+			// budget has NOT yet run out — so a mutation of just this site
+			// would not be caught by that row alone.
+			name:                 "abandoned mid-backoff",
+			payload:              validEnvelope("document.created"),
+			handler:              func(context.Context, Envelope[json.RawMessage]) error { return errBoom },
+			register:             true,
+			retryConfig:          &RetryConfig{MaxImmediateRetries: 1, InitialBackoff: 0, MaxBackoff: 0},
+			cancelBeforeDispatch: true,
+			want:                 "messaging.events.failed",
+			wantLabel:            attrErrorCategory,
+			wantLabelValue:       categoryRetryable,
+			wantEventType:        "document.created",
+		},
+		{
+			name:           "undecodable",
+			payload:        []byte("{not json"),
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryDeserialization,
+		},
+		{
+			// event_type with a single segment fails validateEnvelope's
+			// eventTypePattern, which is the second of the three
+			// deserialization exits and had no telemetry test at all.
+			name:           "invalid envelope",
+			payload:        envelopeWith(func(e *Envelope[json.RawMessage]) { e.EventType = "invalid" }),
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryDeserialization,
+		},
+		{
+			// The third deserialization exit, and the only way to reach
+			// it: validateEnvelope's schemaVersionPattern (^\d+\.\d+\.\d+$)
+			// rejects anything non-numeric before majorVersion is
+			// called, so "abc" would fail one check earlier. A major
+			// that is all digits but overflows int is the case that
+			// passes the pattern and still fails strconv.Atoi.
+			name:           "unparseable schema version",
+			payload:        envelopeWith(func(e *Envelope[json.RawMessage]) { e.SchemaVersion = "99999999999999999999.0.0" }),
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryDeserialization,
+		},
+		{
+			name:           "cap exceeded",
+			payload:        validEnvelope("document.created"),
+			metadata:       map[string]string{internalwatermill.MetadataDeliveryAttempt: "99"},
+			want:           "messaging.events.failed",
+			wantLabel:      attrErrorCategory,
+			wantLabelValue: categoryMaxAttempts,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mp, reader := newTestMeterProvider(t)
+			c := newTestConsumerWithTelemetry(t, mp)
+			c.dlq = &recordingSink{}
+			if tt.retryConfig != nil {
+				c.cfg.Retry = *tt.retryConfig
+			}
+
+			if tt.register {
+				h := tt.handler
+				if err := c.registry.addTyped("documents", "document.created", 1,
+					func(ctx context.Context, env Envelope[json.RawMessage]) error { return h(ctx, env) }); err != nil {
+					t.Fatalf("addTyped() = %v, want nil", err)
+				}
+			}
+
+			ctx := context.Background()
+			if tt.cancelBeforeDispatch {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+
+			_ = c.dispatch(ctx, "documents", tt.payload, tt.metadata)
+
+			got := readMetrics(t, reader)
+			for _, name := range terminal {
+				_, present := got[name]
+				if name == tt.want && !present {
+					t.Errorf("terminal counter %q was not recorded", name)
+				}
+				if name != tt.want && present {
+					t.Errorf("terminal counter %q was recorded; want only %q", name, tt.want)
+				}
+			}
+			if _, ok := got["messaging.processing.duration"]; !ok {
+				t.Error("processing.duration was not recorded")
+			}
+			if _, ok := got["messaging.events.received"]; !ok {
+				t.Error("messaging.events.received was not recorded")
+			}
+
+			attrs := terminalCounterAttrs(t, got[tt.want])
+
+			if tt.wantLabel != "" {
+				v, found := attrs.Value(attribute.Key(tt.wantLabel))
+				if !found {
+					t.Errorf("%s carried no %s attribute; want %q",
+						tt.want, tt.wantLabel, tt.wantLabelValue)
+				} else if v.AsString() != tt.wantLabelValue {
+					t.Errorf("%s = %q, want %q", tt.wantLabel, v.AsString(), tt.wantLabelValue)
+				}
+			}
+
+			v, found := attrs.Value(attribute.Key(attrEventType))
+			switch {
+			case tt.wantEventType == "" && found:
+				t.Errorf("%s carried event_type=%q; the wire value is unbounded and must not be a metric attribute here",
+					tt.want, v.AsString())
+			case tt.wantEventType != "" && !found:
+				t.Errorf("%s carried no event_type attribute; want %q", tt.want, tt.wantEventType)
+			case tt.wantEventType != "" && v.AsString() != tt.wantEventType:
+				t.Errorf("event_type = %q, want %q", v.AsString(), tt.wantEventType)
+			}
+		})
+	}
+}
+
+func TestDispatch_EventTypeAttributeIsBounded(t *testing.T) {
+	// A raw handler takes every event on its topic, so the wire event_type
+	// must not become a metric attribute — that is the unbounded case the
+	// rule exists for. The span carries it regardless.
+	mp, reader := newTestMeterProvider(t)
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+
+	c := newTestConsumerWithTelemetry(t, mp)
+	c.tracer = tp.Tracer(telemetryScope)
+	c.dlq = &recordingSink{}
+
+	if err := c.registry.addRaw("documents", func(context.Context, Envelope[json.RawMessage]) error { return nil }); err != nil {
+		t.Fatalf("addRaw() = %v, want nil", err)
+	}
+
+	env := Envelope[json.RawMessage]{
+		EventID: "018f2e7a-1c6b-7c0a-9f8d-3e4a2b1c5d90", EventType: "attacker.controlled.value",
+		Timestamp: time.Now().UTC(), SchemaVersion: "1.0.0", CorrelationID: "c", Source: "s",
+		Payload: json.RawMessage(`{}`),
+	}
+	body, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshalling envelope: %v", err)
+	}
+
+	if err := c.dispatch(context.Background(), "documents", body, nil); err != nil {
+		t.Fatalf("dispatch() = %v, want nil", err)
+	}
+
+	m := readMetrics(t, reader)["messaging.events.processed"]
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("processed data = %T, want Sum[int64]", m.Data)
+	}
+	if _, found := sum.DataPoints[0].Attributes.Value(attribute.Key(attrEventType)); found {
+		t.Error("event_type was attached as a metric attribute on a raw-handler match")
+	}
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(spans))
+	}
+	var sawEventType bool
+	for _, a := range spans[0].Attributes() {
+		if a.Key == "messaging.foi.event_type" && a.Value.AsString() == "attacker.controlled.value" {
+			sawEventType = true
+		}
+	}
+	if !sawEventType {
+		t.Error("span did not carry the wire event_type")
+	}
+}
+
+func TestRunWithRetry_RecordsRetriesAsCounterAndSpanEvents(t *testing.T) {
+	// Spec §3: one span per delivery, with each immediate retry recorded as
+	// a span event rather than a child span. This asserts both halves — the
+	// counter increments once per retry, and the retries are visible as
+	// events on the single delivery span, not as separate spans.
+	mp, reader := newTestMeterProvider(t)
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+
+	c := newTestConsumerWithTelemetry(t, mp)
+	c.tracer = tp.Tracer(telemetryScope)
+	c.dlq = &recordingSink{}
+	// Keep the backoff out of the test's runtime.
+	c.cfg.Retry.InitialBackoff = time.Nanosecond
+	c.cfg.Retry.MaxBackoff = time.Nanosecond
+
+	var calls int
+	if err := c.registry.addTyped("documents", "document.created", 1,
+		func(context.Context, Envelope[json.RawMessage]) error {
+			calls++
+			if calls < 3 {
+				return errors.New("transient")
+			}
+			return nil
+		}); err != nil {
+		t.Fatalf("addTyped() = %v, want nil", err)
+	}
+
+	env := Envelope[json.RawMessage]{
+		EventID: "018f2e7a-1c6b-7c0a-9f8d-3e4a2b1c5d90", EventType: "document.created",
+		Timestamp: time.Now().UTC(), SchemaVersion: "1.0.0", CorrelationID: "c", Source: "s",
+		Payload: json.RawMessage(`{}`),
+	}
+	body, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshalling envelope: %v", err)
+	}
+
+	if err := c.dispatch(context.Background(), "documents", body, nil); err != nil {
+		t.Fatalf("dispatch() = %v, want nil", err)
+	}
+
+	m, ok := readMetrics(t, reader)["messaging.retries"]
+	if !ok {
+		t.Fatal("messaging.retries was not recorded")
+	}
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("retries data = %T, want Sum[int64]", m.Data)
+	}
+	if got := sum.DataPoints[0].Value; got != 2 {
+		t.Errorf("retries = %d, want 2", got)
+	}
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1 span per delivery regardless of retries", len(spans))
+	}
+	var retryEvents int
+	for _, e := range spans[0].Events() {
+		if e.Name == "retry" {
+			retryEvents++
+		}
+	}
+	if retryEvents != 2 {
+		t.Errorf("retry span events = %d, want 2", retryEvents)
+	}
+}
+
+// terminalCounterAttrs returns the attribute set of a terminal counter that
+// was recorded exactly once.
+//
+// Insisting on a single data point is part of the assertion, not just
+// convenience: two data points on one delivery would mean two different
+// attribute sets were recorded, which is the same defect as two counters
+// firing and would otherwise hide behind an index of [0].
+func terminalCounterAttrs(t *testing.T, m metricdata.Metrics) attribute.Set {
+	t.Helper()
+
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("%s data = %T, want Sum[int64]", m.Name, m.Data)
+	}
+	if len(sum.DataPoints) != 1 {
+		t.Fatalf("%s has %d data points, want 1", m.Name, len(sum.DataPoints))
+	}
+	return sum.DataPoints[0].Attributes
+}
+
+func TestDeadLetter_RecordsCounters(t *testing.T) {
+	// The two DLQ counters are mutually exclusive by construction: a write
+	// either lands, or it does not. Asserting the absence of the other one
+	// in each case is what stops a future refactor recording both.
+	t.Run("success", func(t *testing.T) {
+		mp, reader := newTestMeterProvider(t)
+		c := newTestConsumerWithTelemetry(t, mp)
+		c.dlq = &recordingSink{}
+
+		dl := c.newDeadLetter("documents", ReasonPermanent, errors.New("bad"), 1)
+		if err := c.deadLetter(context.Background(), "documents", dl); err != nil {
+			t.Fatalf("deadLetter() = %v, want nil", err)
+		}
+
+		got := readMetrics(t, reader)
+		m, ok := got["messaging.dlq"]
+		if !ok {
+			t.Fatal("messaging.dlq was not recorded")
+		}
+		if _, ok := got["messaging.dlq.publish.failures"]; ok {
+			t.Error("messaging.dlq.publish.failures was recorded for a successful write")
+		}
+
+		attrs := terminalCounterAttrs(t, m)
+		reason, found := attrs.Value(attribute.Key(attrReason))
+		if !found || reason.AsString() != ReasonPermanent {
+			t.Errorf("reason = %q, want %q", reason.AsString(), ReasonPermanent)
+		}
+		// event_type is deliberately never attached to the DLQ counters:
+		// the deserialization paths have no bounded event type, and an
+		// attribute set that changes shape by reason is harder to query.
+		if _, found := attrs.Value(attribute.Key(attrEventType)); found {
+			t.Error("messaging.dlq carried an event_type attribute; it must never carry one")
+		}
+	})
+
+	t.Run("publish failure", func(t *testing.T) {
+		mp, reader := newTestMeterProvider(t)
+		c := newTestConsumerWithTelemetry(t, mp)
+		c.dlq = &recordingSink{err: errors.New("redis down")}
+
+		dl := c.newDeadLetter("documents", ReasonPermanent, errors.New("bad"), 1)
+		if err := c.deadLetter(context.Background(), "documents", dl); err == nil {
+			t.Fatal("deadLetter() = nil, want an error so the entry is nacked rather than acked into nothing")
+		}
+
+		got := readMetrics(t, reader)
+		m, ok := got["messaging.dlq.publish.failures"]
+		if !ok {
+			t.Fatal("messaging.dlq.publish.failures was not recorded")
+		}
+		if _, ok := got["messaging.dlq"]; ok {
+			t.Error("messaging.dlq was recorded for a write that failed")
+		}
+
+		attrs := terminalCounterAttrs(t, m)
+		reason, found := attrs.Value(attribute.Key(attrReason))
+		if !found || reason.AsString() != ReasonPermanent {
+			t.Errorf("reason = %q, want %q", reason.AsString(), ReasonPermanent)
+		}
+	})
+}
+
+func TestHandleUndecodable_CountsReceivedAndDeadLetters(t *testing.T) {
+	// The invariant this protects: an entry Watermill's marshaller cannot
+	// read never reaches dispatch, so if it were not counted here,
+	// messaging_dlq_total would exceed messaging_events_received_total on
+	// this path — an invariant violation that reads as a metrics bug and
+	// hides the real one underneath it.
+	mp, reader := newTestMeterProvider(t)
+	c := newTestConsumerWithTelemetry(t, mp)
+	sink := &recordingSink{}
+	c.dlq = sink
+
+	topicByStream := map[string]string{"foi:documents": "documents"}
+	fields := map[string]any{"garbage": "value"}
+
+	if err := c.handleUndecodable(context.Background(), topicByStream, "foi:documents", "1-0", fields); err != nil {
+		t.Fatalf("handleUndecodable() = %v, want nil", err)
+	}
+
+	got := readMetrics(t, reader)
+	received, ok := got["messaging.events.received"]
+	if !ok {
+		t.Fatal("messaging.events.received was not recorded for an undecodable entry")
+	}
+	dlq, ok := got["messaging.dlq"]
+	if !ok {
+		t.Fatal("messaging.dlq was not recorded for an undecodable entry")
+	}
+
+	// Both counters fired exactly once, which is the invariant: dlq must
+	// never exceed received on this path. terminalCounterAttrs enforces
+	// the "exactly once" half for both; presence-checking the map key
+	// above only proves "at least once".
+	receivedAttrs := terminalCounterAttrs(t, received)
+	topic, found := receivedAttrs.Value(attribute.Key(attrTopic))
+	if !found || topic.AsString() != "documents" {
+		t.Errorf("received topic = %q, want %q", topic.AsString(), "documents")
+	}
+
+	dlqAttrs := terminalCounterAttrs(t, dlq)
+	reason, found := dlqAttrs.Value(attribute.Key(attrReason))
+	if !found || reason.AsString() != ReasonDeserializationFailed {
+		t.Errorf("dlq reason = %q, want %q", reason.AsString(), ReasonDeserializationFailed)
+	}
+
+	dl := sink.only(t)
+	if dl.Reason != ReasonDeserializationFailed {
+		t.Errorf("dead letter reason = %q, want %q", dl.Reason, ReasonDeserializationFailed)
+	}
+	// The raw Redis fields are preserved, since the original bytes are
+	// unreachable once the marshaller has failed.
+	if len(dl.EventRaw) == 0 {
+		t.Error("dead letter EventRaw is empty; the undecodable entry's fields were not preserved")
+	}
+	if dl.Event != nil {
+		t.Error("dead letter Event is set; an unreadable entry has no parseable event")
+	}
+}
+
+func TestHandleUndecodable_UnknownStreamIsAnError(t *testing.T) {
+	// Erroring leaves the entry pending for the next reclaim sweep rather
+	// than acking it into nothing.
+	mp, reader := newTestMeterProvider(t)
+	c := newTestConsumerWithTelemetry(t, mp)
+	c.dlq = &recordingSink{}
+
+	err := c.handleUndecodable(context.Background(), map[string]string{}, "foi:unknown", "1-0", nil)
+	if err == nil {
+		t.Fatal("handleUndecodable() = nil, want an error so the entry stays pending")
+	}
+
+	// Nothing is counted for a stream we cannot map to a topic: there is no
+	// bounded topic label to attribute it to, and counting it under a
+	// wrong one would be worse than not counting it.
+	got := readMetrics(t, reader)
+	if _, ok := got["messaging.events.received"]; ok {
+		t.Error("messaging.events.received was recorded for an unmappable stream")
+	}
+	if _, ok := got["messaging.dlq"]; ok {
+		t.Error("messaging.dlq was recorded for an unmappable stream")
+	}
+}
+
+func TestDispatch_QueueLatency(t *testing.T) {
+	// queue.latency is the only metric that distinguishes "our handlers are
+	// slow" from "we are behind on the stream". It is also the only one
+	// whose input comes from another host's clock, so the degenerate cases
+	// matter as much as the happy one.
+	tests := []struct {
+		name        string
+		publishedAt string
+		wantRecord  bool
+	}{
+		{"recorded", time.Now().UTC().Add(-2 * time.Second).Format(time.RFC3339Nano), true},
+		{"missing", "", false},
+		{"unparseable", "not-a-timestamp", false},
+		// Clock skew: a publisher whose clock runs ahead yields a negative
+		// elapsed time. Clamped to zero rather than skipped — the delivery
+		// did happen, and a negative bucket is nonsense.
+		{"skewed future", time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mp, reader := newTestMeterProvider(t)
+			c := newTestConsumerWithTelemetry(t, mp)
+			c.dlq = &recordingSink{}
+
+			def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+			if err := RegisterHandler(c, def, noopHandler{}); err != nil {
+				t.Fatalf("RegisterHandler() = %v, want nil", err)
+			}
+
+			metadata := map[string]string{}
+			if tt.publishedAt != "" {
+				metadata[metadataPublishedAt] = tt.publishedAt
+			}
+
+			if err := c.dispatch(context.Background(), "documents", validEnvelopeJSON(), metadata); err != nil {
+				t.Fatalf("dispatch() = %v, want nil", err)
+			}
+
+			m, ok := readMetrics(t, reader)["messaging.queue.latency"]
+			if ok != tt.wantRecord {
+				t.Fatalf("queue.latency recorded = %v, want %v", ok, tt.wantRecord)
+			}
+			if !tt.wantRecord {
+				return
+			}
+
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("queue.latency data = %T, want Histogram[float64]", m.Data)
+			}
+			if len(hist.DataPoints) != 1 {
+				t.Fatalf("queue.latency has %d data points, want 1", len(hist.DataPoints))
+			}
+			dp := hist.DataPoints[0]
+			if dp.Sum < 0 {
+				t.Errorf("queue.latency sum = %v, want >= 0 (skew must be clamped, not recorded negative)", dp.Sum)
+			}
+			topic, found := dp.Attributes.Value(attribute.Key(attrTopic))
+			if !found || topic.AsString() != "documents" {
+				t.Errorf("queue.latency topic = %q, want %q", topic.AsString(), "documents")
+			}
+
+			// The happy case must record a real elapsed time, not zero —
+			// otherwise a bug that always clamped would pass the
+			// non-negative check above.
+			if tt.name == "recorded" && dp.Sum <= 0 {
+				t.Errorf("queue.latency sum = %v, want a positive elapsed time", dp.Sum)
+			}
+			if tt.name == "skewed future" && dp.Sum != 0 {
+				t.Errorf("queue.latency sum = %v, want exactly 0 for a future published_at", dp.Sum)
+			}
+		})
+	}
+}
+
+func TestDispatch_LogPayloadsAndTraceCorrelation(t *testing.T) {
+	// Two separate contracts share this test because they share a logger:
+	// payload bytes must appear on error lines only when LogPayloads is on,
+	// and trace_id/span_id must always be present so a log line and its
+	// trace are navigable from each other.
+	tests := []struct {
+		name        string
+		logPayloads bool
+		wantPayload bool
+	}{
+		{"payloads off", false, false},
+		{"payloads on", true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			mp, _ := newTestMeterProvider(t)
+			// A recorder rather than a bare TracerProvider: asserting mere
+			// key presence let `sc := span.SpanContext()` degrade to `var
+			// sc trace.SpanContext` (consumer.go:415) — an all-zero span
+			// context — without failing anything. Capturing the real
+			// ended span lets the assertion pin the exact ID logged.
+			recorder := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+
+			c := newTestConsumerWithTelemetry(t, mp)
+			c.cfg.Telemetry.Logger = slog.New(slog.NewJSONHandler(&buf,
+				&slog.HandlerOptions{Level: slog.LevelDebug}))
+			c.cfg.Telemetry.LogPayloads = tt.logPayloads
+			c.tracer = tp.Tracer(telemetryScope)
+			c.dlq = &recordingSink{}
+
+			// An undecodable payload takes an error path, which is where
+			// payloads are logged if at all.
+			_ = c.dispatch(context.Background(), "documents",
+				[]byte(`{"secret":"hunter2"`), nil)
+
+			out := buf.String()
+			if got := strings.Contains(out, "hunter2"); got != tt.wantPayload {
+				t.Errorf("log contains payload = %v, want %v\nlog: %s", got, tt.wantPayload, out)
+			}
+
+			spans := recorder.Ended()
+			if len(spans) != 1 {
+				t.Fatalf("recorded %d spans, want 1", len(spans))
+			}
+			sc := spans[0].SpanContext()
+			if !sc.IsValid() {
+				t.Fatalf("delivery span context is invalid; test setup is broken")
+			}
+			// Pinning the exact IDs, not just the keys' presence: a bug
+			// that logs a zero-valued trace_id/span_id must fail this,
+			// same as a bug that omits the fields outright.
+			if wantTraceID := `"trace_id":"` + sc.TraceID().String() + `"`; !strings.Contains(out, wantTraceID) {
+				t.Errorf("log trace_id does not match the delivery's span (want %s)\nlog: %s", wantTraceID, out)
+			}
+			if wantSpanID := `"span_id":"` + sc.SpanID().String() + `"`; !strings.Contains(out, wantSpanID) {
+				t.Errorf("log span_id does not match the delivery's span (want %s)\nlog: %s", wantSpanID, out)
+			}
+		})
+	}
+}
+
+func TestRunWithRetry_LogsCarryTraceCorrelation(t *testing.T) {
+	// The retry loop builds its own logger. It must extend dispatch's
+	// rather than starting from the config logger, or every retry and
+	// handler-failure line silently loses its trace correlation — the lines
+	// an operator most wants to jump to a trace from.
+	var buf bytes.Buffer
+	mp, _ := newTestMeterProvider(t)
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+
+	c := newTestConsumerWithTelemetry(t, mp)
+	c.cfg.Telemetry.Logger = slog.New(slog.NewJSONHandler(&buf,
+		&slog.HandlerOptions{Level: slog.LevelDebug}))
+	c.tracer = tp.Tracer(telemetryScope)
+	c.dlq = &recordingSink{}
+	c.cfg.Retry.InitialBackoff = time.Nanosecond
+	c.cfg.Retry.MaxBackoff = time.Nanosecond
+
+	def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+	if err := RegisterHandler(c, def, handlerFunc(func(context.Context, Envelope[testPayload]) error {
+		return AsPermanent(errors.New("nope"))
+	})); err != nil {
+		t.Fatalf("RegisterHandler() = %v, want nil", err)
+	}
+
+	if err := c.dispatch(context.Background(), "documents", validEnvelopeJSON(), nil); err != nil {
+		t.Fatalf("dispatch() = %v, want nil", err)
+	}
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("recorded %d spans, want 1", len(spans))
+	}
+	sc := spans[0].SpanContext()
+	if !sc.IsValid() {
+		t.Fatalf("delivery span context is invalid; test setup is broken")
+	}
+	wantTraceID := `"trace_id":"` + sc.TraceID().String() + `"`
+	wantSpanID := `"span_id":"` + sc.SpanID().String() + `"`
+
+	// The permanent-error line comes from runWithRetry, not dispatch.
+	out := buf.String()
+	if !strings.Contains(out, "handler returned a permanent error") {
+		t.Fatalf("expected the permanent-error line\nlog: %s", out)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.Contains(line, "handler returned a permanent error") {
+			// Pinning the exact IDs, not just the keys' presence — see
+			// TestDispatch_LogPayloadsAndTraceCorrelation for why.
+			if !strings.Contains(line, wantTraceID) || !strings.Contains(line, wantSpanID) {
+				t.Errorf("runWithRetry line lost its trace correlation:\n%s", line)
+			}
+		}
 	}
 }

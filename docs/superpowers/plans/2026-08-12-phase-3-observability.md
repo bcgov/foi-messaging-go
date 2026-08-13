@@ -488,6 +488,12 @@ const (
 // instruments holds every metric the library records. It is built once per
 // Publisher and per Consumer; recording through it is safe from any
 // goroutine, as OTel instruments are.
+//
+// Renaming anything here is a breaking change for every dashboard built on
+// this library. Two tests must be updated together:
+// TestNewInstruments_CreatesEveryInstrument in this package (the real
+// rename guard), and TestPrometheusNames in examples/telemetry, which is a
+// separate module and therefore holds a copy of the list.
 type instruments struct {
 	published          metric.Int64Counter
 	publishFailures    metric.Int64Counter
@@ -2538,9 +2544,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// TestPrometheusNames pins the exported metric names. They are the
-// library's contract with every dashboard and alert built on it, so an
-// instrument rename must break a test rather than a Grafana panel.
+// TestPrometheusNames verifies the OTel-to-Prometheus name translation:
+// that dotted instrument names become underscored ones, that monotonic
+// counters gain _total, that unit "s" becomes _seconds, and that {event}
+// and {retry} annotation units are dropped rather than suffixed.
+//
+// It is NOT a rename guard for the library's instruments. This example is
+// a separate module and cannot reach messaging's unexported instrument
+// set, so the names below are a copy; renaming an instrument in
+// telemetry.go will not fail this test. The rename guard is
+// TestNewInstruments_CreatesEveryInstrument in the root module, which
+// asserts against the real instruments. Both lists must be updated
+// together — telemetry.go carries a comment saying so.
 func TestPrometheusNames(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	mp, err := NewMeterProvider(reg)

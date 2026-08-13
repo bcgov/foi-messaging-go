@@ -12,6 +12,13 @@
 // that path is published to its topic's dead letter queue as a DeadLetter
 // and acked.
 //
-// OpenTelemetry spans and Prometheus metrics (Phase 3) and the
-// application-facing testing package (Phase 4) are not yet implemented.
+// Observability is live: Publish opens a producer span and dispatch opens a
+// consumer span parented to it via traceparent transport metadata, and both
+// paths record OpenTelemetry metrics — eleven instruments covering publish,
+// receive, process, failure, skip, retry, and dead-letter counts plus
+// processing-duration and queue-latency histograms. The library depends on
+// the OTel metric API only; see examples/telemetry for Prometheus wiring,
+// including the histogram bucket View that recipe requires.
+//
+// The application-facing testing package (Phase 4) is not yet implemented.
 package messaging

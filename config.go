@@ -12,6 +12,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -112,14 +113,34 @@ type RetryConfig struct {
 
 // TelemetryConfig configures observability integration. Logger is defaulted
 // by Validate and is used throughout the consume path — the subscriber's
-// loops, dispatch, and watermill's own router logs all go through it. The
-// tracer and meter providers are defaulted but inert: span creation and
-// metric emission arrive in Phase 3.
+// loops, dispatch, and watermill's own router logs all go through it.
+// Propagator is defaulted here and carries trace context across the
+// publish/consume boundary. TracerProvider and MeterProvider default to
+// otel.GetTracerProvider()/otel.GetMeterProvider() when nil, and are live:
+// Publish and the consume path both open spans and record the full set of
+// PRD §16 metrics through them. An application that never calls
+// otel.SetTracerProvider/otel.SetMeterProvider gets the OTel SDK's no-op
+// implementations, which is a silent way to end up with no telemetry rather
+// than an error — set these fields explicitly, or call the otel.Set*
+// functions before constructing a Publisher or Consumer.
 type TelemetryConfig struct {
 	TracerProvider trace.TracerProvider
 	MeterProvider  metric.MeterProvider
-	Logger         *slog.Logger
-	LogPayloads    bool
+	// Propagator injects trace context at publish and extracts it at
+	// consume (PRD §5). It defaults to propagation.TraceContext{}
+	// directly, NOT to otel.GetTextMapPropagator(), which returns a no-op
+	// unless the application has called otel.SetTextMapPropagator. A
+	// no-op here would leave traceparent unwritten and every consumer
+	// span a disconnected root, with nothing reporting a fault — the
+	// failure would surface only during the first incident the tracing
+	// was bought for.
+	//
+	// Baggage is deliberately not composited in: PRD §5's transport
+	// metadata table lists traceparent and tracestate and nothing else.
+	// Applications wanting baggage pass their own composite here.
+	Propagator  propagation.TextMapPropagator
+	Logger      *slog.Logger
+	LogPayloads bool
 }
 
 // Config is the library's single configuration object. A minimal config is
@@ -187,6 +208,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Telemetry.MeterProvider == nil {
 		c.Telemetry.MeterProvider = otel.GetMeterProvider()
+	}
+	if c.Telemetry.Propagator == nil {
+		c.Telemetry.Propagator = propagation.TraceContext{}
 	}
 	if c.Telemetry.Logger == nil {
 		c.Telemetry.Logger = slog.Default()
