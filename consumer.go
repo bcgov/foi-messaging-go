@@ -216,39 +216,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		ClaimMinIdle:  c.cfg.Consumer.ClaimMinIdle,
 		Logger:        c.cfg.Telemetry.Logger,
 		OnUndecodable: func(stream, entryID string, fields map[string]any) error {
-			topic, ok := topicByStream[stream]
-			if !ok {
-				return fmt.Errorf("no topic registered for stream %q", stream)
-			}
-
-			// The original bytes are unreachable — the marshaller failed
-			// before producing a payload — so the raw Redis fields are what
-			// gets preserved. PRD §14 did not anticipate a
-			// marshaller-level failure; this is the nearest thing to
-			// "the raw bytes" that exists at this point.
-			raw, err := json.Marshal(fields)
-			if err != nil {
-				return fmt.Errorf("marshalling fields of undecodable entry %q: %w", entryID, err)
-			}
-
-			dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
-				fmt.Errorf("stream entry %q could not be unmarshalled", entryID), 1)
-			dl.EventRaw = raw
-
-			// Detached from Run's ctx, and timeout-bounded, for the same
-			// reason the subscriber's ack path is: an entry reaching this
-			// hook during the drain must still be recorded, and Run's ctx
-			// is already cancelled by then. Without this the DLQ write
-			// fails with context.Canceled at exactly the moment there is a
-			// backlog to clear.
-			//
-			// The same reasoning does not apply to the DLQ writes inside
-			// dispatch: those run on the message context, which is already
-			// context.WithoutCancel-derived and stays live for the whole
-			// drain.
-			dlqCtx, cancelDLQ := context.WithTimeout(context.WithoutCancel(ctx), dlqPublishTimeout)
-			defer cancelDLQ()
-			return c.deadLetter(dlqCtx, topic, dl)
+			return c.handleUndecodable(ctx, topicByStream, stream, entryID, fields)
 		},
 	})
 	if err != nil {
@@ -296,6 +264,56 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 
 	return errors.Join(runErr, closeErr, subCloseErr, readerErr)
+}
+
+// handleUndecodable records and dead-letters a stream entry that Watermill's
+// marshaller could not read at all.
+//
+// It is a method rather than the inline closure it began as so its metrics
+// and its DLQ routing are reachable from a unit test: provoking a
+// marshaller-level failure against a live broker means writing a
+// deliberately corrupt entry, which is a lot of setup for a path that is
+// pure error handling.
+//
+// runCtx is Run's context, used only as the parent to detach from.
+func (c *Consumer) handleUndecodable(runCtx context.Context, topicByStream map[string]string, stream, entryID string, fields map[string]any) error {
+	topic, ok := topicByStream[stream]
+	if !ok {
+		return fmt.Errorf("no topic registered for stream %q", stream)
+	}
+
+	// Counted here and nowhere else: an entry the marshaller cannot read
+	// never reaches dispatch, so without this messaging_dlq_total would
+	// exceed messaging_events_received_total on this path — an invariant
+	// violation that reads as a metrics bug and hides the real one
+	// underneath it.
+	c.inst.received.Add(runCtx, 1, metric.WithAttributes(attribute.String(attrTopic, topic)))
+
+	// The original bytes are unreachable — the marshaller failed before
+	// producing a payload — so the raw Redis fields are what gets
+	// preserved. PRD §14 did not anticipate a marshaller-level failure;
+	// this is the nearest thing to "the raw bytes" that exists here.
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return fmt.Errorf("marshalling fields of undecodable entry %q: %w", entryID, err)
+	}
+
+	dl := c.newDeadLetter(topic, ReasonDeserializationFailed,
+		fmt.Errorf("stream entry %q could not be unmarshalled", entryID), 1)
+	dl.EventRaw = raw
+
+	// Detached from Run's ctx, and timeout-bounded, for the same reason
+	// the subscriber's ack path is: an entry reaching this hook during the
+	// drain must still be recorded, and Run's ctx is already cancelled by
+	// then. Without this the DLQ write fails with context.Canceled at
+	// exactly the moment there is a backlog to clear.
+	//
+	// The same reasoning does not apply to the DLQ writes inside dispatch:
+	// those run on the message context, which is already
+	// context.WithoutCancel-derived and stays live for the whole drain.
+	dlqCtx, cancelDLQ := context.WithTimeout(context.WithoutCancel(runCtx), dlqPublishTimeout)
+	defer cancelDLQ()
+	return c.deadLetter(dlqCtx, topic, dl)
 }
 
 // closeReader closes reader and clears it from Consumer state so a later
@@ -580,12 +598,21 @@ func (c *Consumer) deadLetter(ctx context.Context, topic string, dl DeadLetter) 
 		return fmt.Errorf("marshalling dead letter for %q: %w", stream, err)
 	}
 
+	// event_type is deliberately absent: the DLQ paths include
+	// deserialization failures where no bounded event type exists, and a
+	// metric whose attribute set changes shape by reason is harder to query
+	// than one that never carries it.
+	attrs := consumeAttrs(topic, c.cfg.Consumer.Group, "", attribute.String(attrReason, dl.Reason))
+
 	if err := sink.publish(ctx, stream, body); err != nil {
+		c.inst.dlqPublishFailures.Add(ctx, 1, metric.WithAttributes(attrs...))
 		c.cfg.Telemetry.Logger.Error("messaging: dead letter publish failed",
 			"topic", topic, "dlq_stream", stream, "reason", dl.Reason,
 			"delivery_attempts", dl.DeliveryAttempts, "error", err)
 		return fmt.Errorf("publishing dead letter to %q: %w", stream, err)
 	}
+
+	c.inst.dlq.Add(ctx, 1, metric.WithAttributes(attrs...))
 
 	// Warn, not Info: a dead letter is an event no handler will ever
 	// process, and it needs to be visible without turning on debug logging.

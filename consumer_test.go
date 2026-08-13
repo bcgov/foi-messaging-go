@@ -1250,3 +1250,139 @@ func terminalCounterAttrs(t *testing.T, m metricdata.Metrics) attribute.Set {
 	}
 	return sum.DataPoints[0].Attributes
 }
+
+func TestDeadLetter_RecordsCounters(t *testing.T) {
+	// The two DLQ counters are mutually exclusive by construction: a write
+	// either lands, or it does not. Asserting the absence of the other one
+	// in each case is what stops a future refactor recording both.
+	t.Run("success", func(t *testing.T) {
+		mp, reader := newTestMeterProvider(t)
+		c := newTestConsumerWithTelemetry(t, mp)
+		c.dlq = &recordingSink{}
+
+		dl := c.newDeadLetter("documents", ReasonPermanent, errors.New("bad"), 1)
+		if err := c.deadLetter(context.Background(), "documents", dl); err != nil {
+			t.Fatalf("deadLetter() = %v, want nil", err)
+		}
+
+		got := readMetrics(t, reader)
+		m, ok := got["messaging.dlq"]
+		if !ok {
+			t.Fatal("messaging.dlq was not recorded")
+		}
+		if _, ok := got["messaging.dlq.publish.failures"]; ok {
+			t.Error("messaging.dlq.publish.failures was recorded for a successful write")
+		}
+
+		attrs := terminalCounterAttrs(t, m)
+		reason, found := attrs.Value(attribute.Key(attrReason))
+		if !found || reason.AsString() != ReasonPermanent {
+			t.Errorf("reason = %q, want %q", reason.AsString(), ReasonPermanent)
+		}
+		// event_type is deliberately never attached to the DLQ counters:
+		// the deserialization paths have no bounded event type, and an
+		// attribute set that changes shape by reason is harder to query.
+		if _, found := attrs.Value(attribute.Key(attrEventType)); found {
+			t.Error("messaging.dlq carried an event_type attribute; it must never carry one")
+		}
+	})
+
+	t.Run("publish failure", func(t *testing.T) {
+		mp, reader := newTestMeterProvider(t)
+		c := newTestConsumerWithTelemetry(t, mp)
+		c.dlq = &recordingSink{err: errors.New("redis down")}
+
+		dl := c.newDeadLetter("documents", ReasonPermanent, errors.New("bad"), 1)
+		if err := c.deadLetter(context.Background(), "documents", dl); err == nil {
+			t.Fatal("deadLetter() = nil, want an error so the entry is nacked rather than acked into nothing")
+		}
+
+		got := readMetrics(t, reader)
+		m, ok := got["messaging.dlq.publish.failures"]
+		if !ok {
+			t.Fatal("messaging.dlq.publish.failures was not recorded")
+		}
+		if _, ok := got["messaging.dlq"]; ok {
+			t.Error("messaging.dlq was recorded for a write that failed")
+		}
+
+		attrs := terminalCounterAttrs(t, m)
+		reason, found := attrs.Value(attribute.Key(attrReason))
+		if !found || reason.AsString() != ReasonPermanent {
+			t.Errorf("reason = %q, want %q", reason.AsString(), ReasonPermanent)
+		}
+	})
+}
+
+func TestHandleUndecodable_CountsReceivedAndDeadLetters(t *testing.T) {
+	// The invariant this protects: an entry Watermill's marshaller cannot
+	// read never reaches dispatch, so if it were not counted here,
+	// messaging_dlq_total would exceed messaging_events_received_total on
+	// this path — an invariant violation that reads as a metrics bug and
+	// hides the real one underneath it.
+	mp, reader := newTestMeterProvider(t)
+	c := newTestConsumerWithTelemetry(t, mp)
+	sink := &recordingSink{}
+	c.dlq = sink
+
+	topicByStream := map[string]string{"foi:documents": "documents"}
+	fields := map[string]any{"garbage": "value"}
+
+	if err := c.handleUndecodable(context.Background(), topicByStream, "foi:documents", "1-0", fields); err != nil {
+		t.Fatalf("handleUndecodable() = %v, want nil", err)
+	}
+
+	got := readMetrics(t, reader)
+	received, ok := got["messaging.events.received"]
+	if !ok {
+		t.Fatal("messaging.events.received was not recorded for an undecodable entry")
+	}
+	if _, ok := got["messaging.dlq"]; !ok {
+		t.Fatal("messaging.dlq was not recorded for an undecodable entry")
+	}
+
+	// Both counters fired exactly once, which is the invariant: dlq must
+	// never exceed received on this path.
+	receivedAttrs := terminalCounterAttrs(t, received)
+	topic, found := receivedAttrs.Value(attribute.Key(attrTopic))
+	if !found || topic.AsString() != "documents" {
+		t.Errorf("received topic = %q, want %q", topic.AsString(), "documents")
+	}
+
+	dl := sink.only(t)
+	if dl.Reason != ReasonDeserializationFailed {
+		t.Errorf("dead letter reason = %q, want %q", dl.Reason, ReasonDeserializationFailed)
+	}
+	// The raw Redis fields are preserved, since the original bytes are
+	// unreachable once the marshaller has failed.
+	if len(dl.EventRaw) == 0 {
+		t.Error("dead letter EventRaw is empty; the undecodable entry's fields were not preserved")
+	}
+	if dl.Event != nil {
+		t.Error("dead letter Event is set; an unreadable entry has no parseable event")
+	}
+}
+
+func TestHandleUndecodable_UnknownStreamIsAnError(t *testing.T) {
+	// Erroring leaves the entry pending for the next reclaim sweep rather
+	// than acking it into nothing.
+	mp, reader := newTestMeterProvider(t)
+	c := newTestConsumerWithTelemetry(t, mp)
+	c.dlq = &recordingSink{}
+
+	err := c.handleUndecodable(context.Background(), map[string]string{}, "foi:unknown", "1-0", nil)
+	if err == nil {
+		t.Fatal("handleUndecodable() = nil, want an error so the entry stays pending")
+	}
+
+	// Nothing is counted for a stream we cannot map to a topic: there is no
+	// bounded topic label to attribute it to, and counting it under a
+	// wrong one would be worse than not counting it.
+	got := readMetrics(t, reader)
+	if _, ok := got["messaging.events.received"]; ok {
+		t.Error("messaging.events.received was recorded for an unmappable stream")
+	}
+	if _, ok := got["messaging.dlq"]; ok {
+		t.Error("messaging.dlq was recorded for an unmappable stream")
+	}
+}
