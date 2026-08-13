@@ -454,7 +454,7 @@ The library integrates with OpenTelemetry and Prometheus.
 
 ## Tracing
 
-Publish creates a producer span; consume creates a consumer span linked to it via the `traceparent` metadata (Section 5). Handler execution runs inside the consumer span.
+Publish creates a producer span; consume creates a consumer span that is a **child** of it, extracted from the `traceparent` metadata (Section 5). Handler execution runs inside the consumer span.
 
 ## Structured Logging
 

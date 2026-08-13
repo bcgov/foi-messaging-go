@@ -179,7 +179,7 @@ Redis auth/TLS, pool sizing, consumer concurrency, and claim intervals are all c
 
 Consumers emit structured `slog` logs when an envelope cannot be decoded, fails validation, or carries an unparseable schema version, a warning whenever an event is dead-lettered or discarded, and a debug log when no registered handler matches an event. Logged fields include `topic`, `event_id`, `event_type` (when a handler is not found), `error`, and `trace_id`/`span_id` so a log line and its trace are navigable from each other. Correlation IDs propagate through handler contexts via `context.Context`.
 
-Payload contents are **not** logged by default. Set `Telemetry.LogPayloads: true` to include them on the consume path's error lines. They are never placed in span or metric attributes regardless of that setting, because spans and metrics routinely leave the trust boundary that logs stay inside.
+Payload contents are **not** logged by default. Set `Telemetry.LogPayloads: true` to include them on every consume-path log line for a delivery — not just its error lines, since the payload attaches to that delivery's base logger. They are never placed in span or metric attributes regardless of that setting, because spans and metrics routinely leave the trust boundary that logs stay inside.
 
 ### Tracing
 
@@ -207,7 +207,9 @@ The library records through the OpenTelemetry metric API only. It has no Prometh
 | `messaging_processing_duration_seconds` | histogram | topic, event_type, group |
 | `messaging_queue_latency_seconds` | histogram | topic |
 
-Every delivery increments exactly one of `processed`, `failed`, or `skipped`, and records `processing_duration` exactly once. `dlq` is orthogonal and fires alongside `failed` on the dead-letter paths — it answers "what are we giving up on", not "what failed".
+Every delivery increments exactly one of `processed`, `failed`, or `skipped`, and records `processing_duration` exactly once. `dlq` is orthogonal and fires alongside `failed` on the dead-letter paths reached through `dispatch` — it answers "what are we giving up on", not "what failed".
+
+The one exception is a stream entry Watermill's own marshaller cannot read at all: it never reaches `dispatch`, so it increments `received` and `dlq` and **none** of `processed`/`failed`/`skipped`, and never records `processing_duration`. This is deliberate — there is no envelope to attribute a terminal outcome or a duration to — but it means alerting on `rate(messaging_events_failed_total)` alone will not catch a producer that starts writing corrupt entries; watch `messaging_dlq_total` too.
 
 \* `event_type` is attached only when the event matched a **typed** handler registration, where it comes from a set fixed at registration time. On the no-handler, raw-handler, and deserialization paths it is whatever the wire said — unbounded, and one bad producer away from exploding your metric store — so it is omitted from metrics and recorded on the span instead.
 
@@ -217,7 +219,7 @@ A retryable failure NACKs, and the entry is later reclaimed and redelivered. **O
 
 #### `processing_duration` includes the dead-letter write
 
-On the four dead-letter paths the histogram covers the DLQ publish as well as decode and handler time, because that write genuinely occupies the delivery's concurrency slot. A DLQ outage will therefore show up as a p99 `processing_duration_seconds` spike *and* in `messaging_dlq_publish_failures_total`. That correlation is expected; the second metric is the one that tells you which it is.
+On the five dead-letter paths reached through `dispatch`/`runWithRetry` (delivery-cap exceeded, three deserialization failures, and a permanent handler error) the histogram covers the DLQ publish as well as decode and handler time, because that write genuinely occupies the delivery's concurrency slot. A DLQ outage will therefore show up as a p99 `processing_duration_seconds` spike *and* in `messaging_dlq_publish_failures_total`. That correlation is expected; the second metric is the one that tells you which it is. The sixth dead-letter path — an entry the marshaller cannot read at all — never reaches `dispatch`, so it has no `processing_duration` to include a DLQ write time in; see the exception noted above.
 
 #### `queue_latency` depends on clock sync
 

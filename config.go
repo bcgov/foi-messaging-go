@@ -115,8 +115,14 @@ type RetryConfig struct {
 // by Validate and is used throughout the consume path — the subscriber's
 // loops, dispatch, and watermill's own router logs all go through it.
 // Propagator is defaulted here and carries trace context across the
-// publish/consume boundary. The tracer and meter providers are defaulted but
-// still inert: span creation and metric emission arrive later in Phase 3.
+// publish/consume boundary. TracerProvider and MeterProvider default to
+// otel.GetTracerProvider()/otel.GetMeterProvider() when nil, and are live:
+// Publish and the consume path both open spans and record the full set of
+// PRD §16 metrics through them. An application that never calls
+// otel.SetTracerProvider/otel.SetMeterProvider gets the OTel SDK's no-op
+// implementations, which is a silent way to end up with no telemetry rather
+// than an error — set these fields explicitly, or call the otel.Set*
+// functions before constructing a Publisher or Consumer.
 type TelemetryConfig struct {
 	TracerProvider trace.TracerProvider
 	MeterProvider  metric.MeterProvider

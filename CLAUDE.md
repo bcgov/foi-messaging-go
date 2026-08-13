@@ -18,6 +18,8 @@ section still matches.
 ```bash
 make build              # go build ./...
 make test               # unit tests only (no Docker needed)
+make test-examples      # cd examples/telemetry && go test ./...  (a separate Go module)
+make test-all           # make test test-examples — every non-Docker test tier
 make test-integration   # go test -tags=integration ./...  (needs Docker: Testcontainers)
 make lint               # golangci-lint run ./...
 make up / make down     # local Redis on :6379 via docker compose (not used by tests)
@@ -30,16 +32,19 @@ go test -tags=integration -race -count=1 ./...                      # what to ru
 Integration tests start their own disposable Redis container per suite via
 `internal/testsupport.StartRedis` — they do not use `docker-compose.yml`. `make test`
 skips them entirely because of the build tag, so a passing `make test` proves very little
-about the consume path.
+about the consume path. `examples/telemetry` is its own Go module (nested `go.mod`), so
+`./...` from the root never runs it — that's what `make test-examples` is for, and it
+holds the test pinning the exported Prometheus metric names.
 
-There is no CI yet; run lint and both test tiers locally.
+There is no CI yet; run lint and all three test tiers locally.
 
 ## Architecture
 
 Three layers, deliberately separated so the dependency boundary is enforceable:
 
 - **Root package `messaging`** (`config.go`, `publisher.go`, `consumer.go`, `registry.go`,
-  `envelope.go`, `validation.go`, `handler.go`, `context.go`) — the entire public API.
+  `envelope.go`, `validation.go`, `handler.go`, `context.go`, `telemetry.go`) — the entire
+  public API.
   Owns the envelope contract, config defaulting/validation, handler registration,
   and dispatch. Must never import Watermill or go-redis, *including types* like
   `message.Message`.

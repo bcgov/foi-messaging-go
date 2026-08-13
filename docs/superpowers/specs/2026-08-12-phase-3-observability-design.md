@@ -165,6 +165,14 @@ deserialization failure indistinguishable in the one metric operators page on.
 `max_attempts`. The first two come from the PRD §15 classification predicates;
 the last two name failures that never reach a handler.
 
+**Exception:** a stream entry Watermill's own marshaller cannot read at all
+never reaches `dispatch`. It increments `events.received` and `messaging.dlq`
+and *none* of `processed`/`failed`/`skipped`, and never records
+`processing.duration` — there is no envelope to attribute a terminal outcome
+or a duration to. An operator alerting on `rate(events.failed)` alone will not
+catch a producer that starts writing corrupt entries; `messaging.dlq` must be
+watched too.
+
 This invariant is testable — see §5 — and should be tested rather than
 asserted in a comment.
 

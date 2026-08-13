@@ -430,10 +430,13 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 	)
 
 	// PRD §16: payload contents are not logged by default. When enabled
-	// they appear on the consume path's error lines only — and never in
-	// span attributes or metric attributes, whatever this is set to,
-	// because spans and metrics routinely leave the trust boundary that
-	// logs stay inside.
+	// they attach to this delivery's base logger, so they ride every line
+	// built from it below — the no-handler Debug, the cap-exceeded and
+	// discard Warns, the retry Debug in runWithRetry, and the various
+	// error lines — not error lines alone. They never appear in span
+	// attributes or metric attributes, whatever this is set to, because
+	// spans and metrics routinely leave the trust boundary that logs stay
+	// inside.
 	if c.cfg.Telemetry.LogPayloads {
 		log = log.With("payload", string(payload))
 	}
