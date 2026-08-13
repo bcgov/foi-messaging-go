@@ -1,8 +1,10 @@
 # foi-messaging-go
 
+[![ci](https://github.com/bcgov/foi-messaging-go/actions/workflows/ci.yml/badge.svg)](https://github.com/bcgov/foi-messaging-go/actions/workflows/ci.yml)
+
 Standardized asynchronous messaging for FOI platform services — a transport-agnostic Go library built on [Watermill](https://watermill.io/) and Redis Streams.
 
-> **Status: early development (pre-v1.0).** The public API described here reflects the design in [PRD v1.1](docs/foi-messaging-go-prd-v1.1.md) and is being implemented. It is not yet stable and should not be adopted by production services until v1.0.0 is tagged.
+> **Status: released as `v0.1.0`, pre-1.0.** The library is feature-complete against [PRD v1.1](docs/foi-messaging-go-prd-v1.1.md), but the API is not frozen: under `v0.x` breaking changes arrive as minor bumps and the Go toolchain will not auto-upgrade across them. Pin an exact version. `v1.0.0` follows the first FOI service integration.
 
 ---
 
@@ -299,7 +301,7 @@ foi-messaging-go/
     └── redis/
 ```
 
-Applications import the top-level package, and `testing/` from their tests. All Watermill and Redis code stays in `internal/`, enforced by a golangci-lint `depguard` rule (CI enforcement is planned for a later phase).
+Applications import the top-level package, and `testing/` from their tests. All Watermill and Redis code stays in `internal/`, enforced by a golangci-lint `depguard` rule, which CI runs on every pull request.
 
 ## Roadmap
 
@@ -308,6 +310,34 @@ Planned after v1.0: transactional outbox, a Redis-backed idempotency helper, del
 ## Documentation
 
 Full design and rationale live in the [Product Requirements Document](docs/foi-messaging-go-prd-v1.1.md).
+
+## Releasing
+
+Releases are cut by pushing a tag. A published Go module version is immutable —
+once `proxy.golang.org` has served it, it can never be corrected, only
+superseded — so the order here matters.
+
+1. Add a `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, and update the
+   link definitions at the bottom of the file.
+2. Run `make verify`. This is exactly what CI runs, including the `-race`
+   integration tier, which needs Docker.
+3. Confirm CI is green on `main`.
+4. Tag and push:
+
+   ```bash
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+`release.yml` then re-runs every gate on the tagged commit and creates the
+GitHub Release from the matching changelog section. A tag with no changelog
+section fails the release rather than publishing empty notes, and a tag
+containing a hyphen (`v0.1.0-rc.1`) is marked as a prerelease.
+
+If the gates fail, no Release is created — but the tag exists. Delete it
+immediately (`git push --delete origin vX.Y.Z`) and re-tag; that only works
+before anything has fetched the version through the module proxy. After that,
+ship the fix as the next patch version.
 
 ## License
 

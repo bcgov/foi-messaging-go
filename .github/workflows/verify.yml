@@ -1,0 +1,58 @@
+# The single definition of "green" for this repository.
+#
+# Both ci.yml and release.yml call this workflow, so the gates that run on a
+# pull request and the gates that run on a release tag cannot drift apart.
+# That matters more than it looks: the copy that rots is always the one that
+# runs rarely, which would be the release copy, whose failure is the one that
+# cannot be undone.
+name: verify
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned rather than floating on latest: a new linter release
+          # turning a check on by default must not break a release build
+          # that touched no code. Must stay a v2.x — .golangci.yml declares
+          # version: "2", which v1 cannot parse.
+          version: v2.12.2
+          # The action supplies the `run` subcommand itself, so these are the
+          # arguments after it. Equivalent to the Makefile's lint target.
+          args: ./...
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: make test GOTESTFLAGS='-race -count=1'
+      # examples/telemetry is a separate Go module; ./... never reaches it.
+      - run: make test-examples GOTESTFLAGS='-race -count=1'
+      - run: make test-scripts
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # ubuntu-latest ships a working Docker daemon, so the Testcontainers
+      # Redis in internal/testsupport.StartRedis needs no service container
+      # and no setup step.
+      - run: make test-integration GOTESTFLAGS='-race -count=1'

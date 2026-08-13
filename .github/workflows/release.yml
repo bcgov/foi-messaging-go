@@ -1,0 +1,50 @@
+# Cuts a GitHub Release when a v* tag is pushed.
+#
+# The tag is the artifact: proxy.golang.org fetches the repository and builds
+# the module zip itself, so GitHub is not in the `go get` path at all. This
+# Release exists to give humans a changelog at a stable URL.
+#
+# The tag is pushed by hand and therefore already exists when these gates run.
+# The workflow can withhold the Release; it cannot withhold the tag. See the
+# spec's §6 for the recovery procedure when a tag turns out to be bad.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # Fails the job when the tag has no matching CHANGELOG.md section,
+      # rather than publishing a Release with an empty body.
+      - name: Extract the changelog section for this tag
+        run: .github/scripts/changelog-section.sh "$GITHUB_REF_NAME" > notes.md
+
+      - name: Create the GitHub Release
+        env:
+          # Same-repository release: the default token is sufficient. No PAT,
+          # no GitHub App, no organization secret.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=()
+          # A hyphen in a semver tag means a prerelease: v0.1.0-rc.1.
+          case "$GITHUB_REF_NAME" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            "${flags[@]}"
