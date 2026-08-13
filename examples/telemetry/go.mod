@@ -1,6 +1,6 @@
 module github.com/bcgov/foi-messaging-go/examples/telemetry
 
-go 1.26.5
+go 1.25.0
 
 replace github.com/bcgov/foi-messaging-go => ../..
 
