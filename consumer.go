@@ -385,6 +385,29 @@ func (c *Consumer) dispatch(ctx context.Context, topic string, payload []byte, m
 
 	c.inst.received.Add(ctx, 1, metric.WithAttributes(attribute.String(attrTopic, topic)))
 
+	// Publish-to-dispatch latency, which is the only thing that separates
+	// "our handlers are slow" from "we are behind on the stream" —
+	// processing.duration cannot tell those apart because it starts here.
+	//
+	// A missing or unparseable published_at skips the observation and
+	// nothing else: transport metadata that arrived odd is not a reason to
+	// fail a message.
+	if publishedAt, ok := parsePublishedAt(metadata); ok {
+		// published_at is stamped by the publishing host and read by this
+		// one, so this measures elapsed time plus clock skew. A publisher
+		// running ahead yields a negative value, which is clamped rather
+		// than recorded: the delivery did happen, and a negative latency
+		// bucket is nonsense. The skew caveat is documented for operators
+		// rather than corrected for here — there is nothing to correct it
+		// against.
+		latency := time.Since(publishedAt).Seconds()
+		if latency < 0 {
+			latency = 0
+		}
+		c.inst.queueLatency.Record(ctx, latency, metric.WithAttributes(
+			attribute.String(attrTopic, topic)))
+	}
+
 	log := c.cfg.Telemetry.Logger.With(
 		"stream_id", metadata[internalwatermill.MetadataStreamID],
 		"delivery_attempt", metadata[internalwatermill.MetadataDeliveryAttempt],

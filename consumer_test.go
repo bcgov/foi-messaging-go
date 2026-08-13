@@ -1386,3 +1386,79 @@ func TestHandleUndecodable_UnknownStreamIsAnError(t *testing.T) {
 		t.Error("messaging.dlq was recorded for an unmappable stream")
 	}
 }
+
+func TestDispatch_QueueLatency(t *testing.T) {
+	// queue.latency is the only metric that distinguishes "our handlers are
+	// slow" from "we are behind on the stream". It is also the only one
+	// whose input comes from another host's clock, so the degenerate cases
+	// matter as much as the happy one.
+	tests := []struct {
+		name        string
+		publishedAt string
+		wantRecord  bool
+	}{
+		{"recorded", time.Now().UTC().Add(-2 * time.Second).Format(time.RFC3339Nano), true},
+		{"missing", "", false},
+		{"unparseable", "not-a-timestamp", false},
+		// Clock skew: a publisher whose clock runs ahead yields a negative
+		// elapsed time. Clamped to zero rather than skipped — the delivery
+		// did happen, and a negative bucket is nonsense.
+		{"skewed future", time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mp, reader := newTestMeterProvider(t)
+			c := newTestConsumerWithTelemetry(t, mp)
+			c.dlq = &recordingSink{}
+
+			def := EventDef{Topic: "documents", Type: "document.created", Version: "1.0.0"}
+			if err := RegisterHandler(c, def, noopHandler{}); err != nil {
+				t.Fatalf("RegisterHandler() = %v, want nil", err)
+			}
+
+			metadata := map[string]string{}
+			if tt.publishedAt != "" {
+				metadata[metadataPublishedAt] = tt.publishedAt
+			}
+
+			if err := c.dispatch(context.Background(), "documents", validEnvelopeJSON(), metadata); err != nil {
+				t.Fatalf("dispatch() = %v, want nil", err)
+			}
+
+			m, ok := readMetrics(t, reader)["messaging.queue.latency"]
+			if ok != tt.wantRecord {
+				t.Fatalf("queue.latency recorded = %v, want %v", ok, tt.wantRecord)
+			}
+			if !tt.wantRecord {
+				return
+			}
+
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("queue.latency data = %T, want Histogram[float64]", m.Data)
+			}
+			if len(hist.DataPoints) != 1 {
+				t.Fatalf("queue.latency has %d data points, want 1", len(hist.DataPoints))
+			}
+			dp := hist.DataPoints[0]
+			if dp.Sum < 0 {
+				t.Errorf("queue.latency sum = %v, want >= 0 (skew must be clamped, not recorded negative)", dp.Sum)
+			}
+			topic, found := dp.Attributes.Value(attribute.Key(attrTopic))
+			if !found || topic.AsString() != "documents" {
+				t.Errorf("queue.latency topic = %q, want %q", topic.AsString(), "documents")
+			}
+
+			// The happy case must record a real elapsed time, not zero —
+			// otherwise a bug that always clamped would pass the
+			// non-negative check above.
+			if tt.name == "recorded" && dp.Sum <= 0 {
+				t.Errorf("queue.latency sum = %v, want a positive elapsed time", dp.Sum)
+			}
+			if tt.name == "skewed future" && dp.Sum != 0 {
+				t.Errorf("queue.latency sum = %v, want exactly 0 for a future published_at", dp.Sum)
+			}
+		})
+	}
+}
