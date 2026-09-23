@@ -109,3 +109,30 @@ func WriteStreamEntry(ctx context.Context, addr, stream string, fields map[strin
 	}
 	return id, nil
 }
+
+// DestroyGroup connects to addr and removes group from stream via
+// XGROUP DESTROY, so integration tests can take a consumer group away from
+// a running consumer the way an operator, a FLUSHALL, or a failover to a
+// replica without the group would.
+func DestroyGroup(ctx context.Context, addr, stream, group string) error {
+	client := goredis.NewClient(&goredis.Options{Addr: addr})
+	defer func() { _ = client.Close() }()
+
+	if err := client.XGroupDestroy(ctx, stream, group).Err(); err != nil {
+		return fmt.Errorf("destroying group %q on stream %q: %w", group, stream, err)
+	}
+	return nil
+}
+
+// DeleteKey connects to addr and deletes key, so integration tests can
+// remove a whole stream — and every consumer group on it — from under a
+// running consumer.
+func DeleteKey(ctx context.Context, addr, key string) error {
+	client := goredis.NewClient(&goredis.Options{Addr: addr})
+	defer func() { _ = client.Close() }()
+
+	if err := client.Del(ctx, key).Err(); err != nil {
+		return fmt.Errorf("deleting key %q: %w", key, err)
+	}
+	return nil
+}
