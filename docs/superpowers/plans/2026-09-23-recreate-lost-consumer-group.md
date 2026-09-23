@@ -13,7 +13,8 @@ Branch: `fix/recreate-lost-consumer-group`
    WARN is logged, and the next entry is delivered. Implement `recreateGroup`.
    Commit `fix:`.
 3. **`internal/watermill`: recreate from the claim loop.** Same for
-   `PendingOverIdle`/`Claim`. Commit `fix:`.
+   `PendingOverIdle`/`Claim`. Landed in the same `fix:` commit as step 2: both
+   loops share `recreateGroup`, and the tests went red together.
 4. **Root integration test.** Running consumer survives `XGROUP DESTROY` and
    `DEL` of the stream. Commit `test:`.
 5. **Docs.** CHANGELOG `[Unreleased]`, CLAUDE.md consume-path invariants.
