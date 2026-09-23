@@ -11,6 +11,8 @@ dispatch matches on its major component only (PRD §11).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-23
+
 ### Fixed
 
 - A consumer group lost while `Consumer.Run` is running — `FLUSHALL`, a Redis
@@ -20,6 +22,9 @@ dispatch matches on its major component only (PRD §11).
   failed with `NOGROUP` forever: `Run` never returned and nothing was consumed
   until the process restarted. Recreating at `0` redelivers whatever is still
   on the stream, so idempotent handlers matter here as everywhere.
+  Recreation logs a WARN, `messaging: consumer group missing, recreating`,
+  worth alerting on; a recreation that itself fails logs an ERROR,
+  `messaging: recreating consumer group failed`, and is retried.
 
 ## [0.1.0] - 2026-08-13
 
@@ -62,5 +67,6 @@ first FOI service integration.
 - Watermill, go-redis, and watermill-redisstream do not cross the library
   boundary; applications import only the root `messaging` package.
 
-[Unreleased]: https://github.com/bcgov/foi-messaging-go/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bcgov/foi-messaging-go/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/bcgov/foi-messaging-go/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/bcgov/foi-messaging-go/releases/tag/v0.1.0
