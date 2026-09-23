@@ -3,6 +3,7 @@ package watermill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -721,5 +722,260 @@ func TestSubscriber_UndecodableEntryWithoutAHookKeepsTheOldBehaviour(t *testing.
 	time.Sleep(200 * time.Millisecond)
 	if reader.ackedIDs() != nil {
 		t.Error("without a hook the entry must be left pending")
+	}
+}
+
+// lostGroupReader models a consumer group that disappears after Subscribe
+// has created it: the startup EnsureGroup succeeds, and every later verb
+// reports ErrNoGroup until EnsureGroup is called a second time.
+//
+// readReportsLoss chooses whether ReadNew also sees the loss. Turning it off
+// isolates the claim loop, which would otherwise be rescued by the read
+// loop recreating the group first.
+type lostGroupReader struct {
+	*fakeReader
+
+	readReportsLoss bool
+	// pendingHidesLoss makes XPENDING succeed while the group is lost, so
+	// the loss is first seen by XCLAIM — the group vanishing between the
+	// two calls of one sweep.
+	pendingHidesLoss bool
+	// ensureErr, if set, fails every EnsureGroup after the startup one.
+	ensureErr error
+
+	gmu      sync.Mutex
+	ensures  int
+	restored bool
+}
+
+var errLost = fmt.Errorf("reading group: %w", internalredis.ErrNoGroup)
+
+func (l *lostGroupReader) EnsureGroup(context.Context, string) error {
+	l.gmu.Lock()
+	defer l.gmu.Unlock()
+	l.ensures++
+	if l.ensures == 1 {
+		return nil // startup: created, then lost before the first read
+	}
+	if l.ensureErr != nil {
+		return l.ensureErr
+	}
+	l.restored = true
+	return nil
+}
+
+func (l *lostGroupReader) lost() bool {
+	l.gmu.Lock()
+	defer l.gmu.Unlock()
+	return !l.restored
+}
+
+func (l *lostGroupReader) ensureCount() int {
+	l.gmu.Lock()
+	defer l.gmu.Unlock()
+	return l.ensures
+}
+
+func (l *lostGroupReader) ReadNew(ctx context.Context, stream string, count int64, block time.Duration) ([]internalredis.Entry, error) {
+	if l.readReportsLoss && l.lost() {
+		return nil, errLost
+	}
+	return l.fakeReader.ReadNew(ctx, stream, count, block)
+}
+
+func (l *lostGroupReader) PendingOverIdle(ctx context.Context, stream string, minIdle time.Duration, count int64) ([]internalredis.PendingEntry, error) {
+	if l.lost() && !l.pendingHidesLoss {
+		return nil, errLost
+	}
+	return l.fakeReader.PendingOverIdle(ctx, stream, minIdle, count)
+}
+
+func (l *lostGroupReader) Claim(ctx context.Context, stream string, minIdle time.Duration, ids []string) ([]internalredis.Entry, error) {
+	if l.lost() {
+		return nil, errLost
+	}
+	return l.fakeReader.Claim(ctx, stream, minIdle, ids)
+}
+
+// TestSubscriber_ReadLoopRecreatesLostGroup is the reason ErrNoGroup
+// exists. EnsureGroup used to run only in Subscribe, so a group lost while
+// running turned the read loop into a silent forever-retry: every
+// XREADGROUP got NOGROUP, Run never returned, and nothing was consumed
+// until a restart.
+func TestSubscriber_ReadLoopRecreatesLostGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader := &lostGroupReader{
+		fakeReader:      newFakeReader(entry("1-0", "event-a", "{}")),
+		readReportsLoss: true,
+	}
+	capture := &capturingHandler{}
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:      reader,
+		Concurrency: 1,
+		BlockTime:   10 * time.Millisecond,
+		Logger:      slog.New(capture),
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	out, err := sub.Subscribe(ctx, "stream")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case msg := <-out:
+		if msg.UUID != "event-a" {
+			t.Errorf("UUID = %q, want %q", msg.UUID, "event-a")
+		}
+		msg.Ack()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out: the read loop never recovered from a lost consumer group")
+	}
+
+	if n := reader.ensureCount(); n < 2 {
+		t.Errorf("EnsureGroup calls = %d, want at least 2 (startup + recreate)", n)
+	}
+	r, ok := capture.find("messaging: consumer group missing, recreating")
+	if !ok {
+		t.Fatal("recreating a lost group logged nothing; an operator should see it happen")
+	}
+	if r.Level != slog.LevelWarn {
+		t.Errorf("level = %v, want %v", r.Level, slog.LevelWarn)
+	}
+	if v, ok := attrValue(r, "stream"); !ok || v.String() != "stream" {
+		t.Errorf("stream attr = %v (present=%v), want %q", v, ok, "stream")
+	}
+}
+
+// TestSubscriber_ClaimLoopRecreatesLostGroup covers the claim loop on its
+// own. XPENDING fails with NOGROUP just as XREADGROUP does, and a claim loop
+// left retrying it forever means nacked messages are never redelivered.
+func TestSubscriber_ClaimLoopRecreatesLostGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake := newFakeReader()
+	fake.pending = []internalredis.PendingEntry{{ID: "1-0", RetryCount: 1, Idle: time.Second}}
+	fake.claimed["1-0"] = entry("1-0", "event-a", "{}")
+	reader := &lostGroupReader{fakeReader: fake}
+
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:        reader,
+		Concurrency:   1,
+		ClaimInterval: 20 * time.Millisecond,
+		ClaimMinIdle:  10 * time.Millisecond,
+		BlockTime:     10 * time.Millisecond,
+		Logger:        slog.New(&capturingHandler{}),
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	out, err := sub.Subscribe(ctx, "stream")
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case msg := <-out:
+		if msg.UUID != "event-a" {
+			t.Errorf("UUID = %q, want %q", msg.UUID, "event-a")
+		}
+		msg.Ack()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out: the claim loop never recovered from a lost consumer group")
+	}
+}
+
+// TestSubscriber_LogsFailedGroupRecreation: if recreating the group fails
+// too — Redis is still coming back, say — that must be as loud as any
+// other consume-path failure, not swallowed.
+func TestSubscriber_LogsFailedGroupRecreation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader := &lostGroupReader{
+		fakeReader:      newFakeReader(),
+		readReportsLoss: true,
+		ensureErr:       errors.New("LOADING Redis is loading the dataset in memory"),
+	}
+	capture := &capturingHandler{}
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:      reader,
+		Concurrency: 1,
+		BlockTime:   10 * time.Millisecond,
+		Logger:      slog.New(capture),
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	if _, err := sub.Subscribe(ctx, "stream"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		if r, ok := capture.find("messaging: recreating consumer group failed"); ok {
+			if r.Level != slog.LevelError {
+				t.Errorf("level = %v, want %v", r.Level, slog.LevelError)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("a failed group recreation logged nothing")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// TestSubscriber_ClaimRecreatesGroupLostMidSweep: the group can vanish
+// between a sweep's XPENDING and its XCLAIM. The claim then fails with
+// NOGROUP, and that must recreate the group too rather than be logged as a
+// lost claim race and forgotten.
+func TestSubscriber_ClaimRecreatesGroupLostMidSweep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake := newFakeReader()
+	fake.pending = []internalredis.PendingEntry{{ID: "1-0", RetryCount: 1, Idle: time.Second}}
+	reader := &lostGroupReader{fakeReader: fake, pendingHidesLoss: true}
+
+	capture := &capturingHandler{}
+	sub, err := NewSubscriber(SubscriberOptions{
+		Reader:        reader,
+		Concurrency:   1,
+		ClaimInterval: 20 * time.Millisecond,
+		ClaimMinIdle:  10 * time.Millisecond,
+		BlockTime:     10 * time.Millisecond,
+		Logger:        slog.New(capture),
+	})
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	if _, err := sub.Subscribe(ctx, "stream"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for reader.ensureCount() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("a claim failing with NOGROUP did not recreate the group")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if _, ok := capture.find("messaging: consumer group missing, recreating"); !ok {
+		t.Error("recreation from the claim path logged nothing")
 	}
 }

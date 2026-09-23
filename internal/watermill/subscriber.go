@@ -209,12 +209,16 @@ func (sc *subscription) readLoop(ctx context.Context) {
 				return
 			}
 			if err != nil {
-				// Unlogged, a read that keeps failing — an
-				// unreachable Redis, say — loops here forever in
-				// silence: Run never returns, nothing is consumed,
-				// and the consumer still looks connected.
-				s.logger.Error("messaging: reading from stream failed",
-					"stream", sc.stream, "error", err)
+				if errors.Is(err, internalredis.ErrNoGroup) {
+					sc.recreateGroup(ctx)
+				} else {
+					// Unlogged, a read that keeps failing — an
+					// unreachable Redis, say — loops here forever in
+					// silence: Run never returns, nothing is consumed,
+					// and the consumer still looks connected.
+					s.logger.Error("messaging: reading from stream failed",
+						"stream", sc.stream, "error", err)
+				}
 				s.pause(ctx, readErrorBackoff)
 			}
 			continue
@@ -253,10 +257,14 @@ func (sc *subscription) claimLoop(ctx context.Context) {
 			if s.stopped(ctx) {
 				return
 			}
-			// A reclaim sweep that keeps failing means nacked
-			// messages are never redelivered. Say so.
-			s.logger.Error("messaging: scanning pending entries failed",
-				"stream", sc.stream, "error", err)
+			if errors.Is(err, internalredis.ErrNoGroup) {
+				sc.recreateGroup(ctx)
+			} else {
+				// A reclaim sweep that keeps failing means nacked
+				// messages are never redelivered. Say so.
+				s.logger.Error("messaging: scanning pending entries failed",
+					"stream", sc.stream, "error", err)
+			}
 			s.pause(ctx, readErrorBackoff)
 			continue
 		}
@@ -273,6 +281,12 @@ func (sc *subscription) claimLoop(ctx context.Context) {
 				if s.stopped(ctx) {
 					return
 				}
+				if errors.Is(err, internalredis.ErrNoGroup) {
+					// Every remaining ID in this sweep belonged to the
+					// lost group's pending list, which went with it.
+					sc.recreateGroup(ctx)
+					break
+				}
 				if err != nil {
 					s.logger.Error("messaging: claiming pending entry failed",
 						"stream", sc.stream, "entry_id", p.ID, "error", err)
@@ -286,6 +300,41 @@ func (sc *subscription) claimLoop(ctx context.Context) {
 				return
 			}
 		}
+	}
+}
+
+// recreateGroup restores a consumer group that has vanished while the
+// subscription was running — a FLUSHALL, a Redis restart without
+// persistence, a failover to a replica that never had the group, a DEL of
+// the stream, or an XGROUP DESTROY.
+//
+// Subscribe's EnsureGroup used to be the only place the group was created,
+// so after such a loss every XREADGROUP and XPENDING failed with NOGROUP and
+// both loops retried forever: Run never returned, nothing was consumed, and
+// only a process restart recovered. NOGROUP is not transient, so backing off
+// can never fix it; creating the group again does.
+//
+// The group is recreated at "0", as at startup, so whatever is still on the
+// stream is redelivered. Duplicates are the price, and at-least-once
+// delivery already obliges handlers to tolerate them; "$" would instead
+// silently skip everything published between the loss and now. The lost
+// group's pending list cannot be recovered either way.
+//
+// It is safe for the read loop, the claim loop, and every other instance in
+// the group to race here: EnsureGroup treats BUSYGROUP as success. Callers
+// still pause readErrorBackoff afterwards, so something repeatedly
+// destroying the group cannot turn this into a hot loop against Redis.
+func (sc *subscription) recreateGroup(ctx context.Context) {
+	s := sc.sub
+
+	s.logger.Warn("messaging: consumer group missing, recreating",
+		"stream", sc.stream)
+	if err := s.reader.EnsureGroup(ctx, sc.stream); err != nil {
+		if s.stopped(ctx) {
+			return
+		}
+		s.logger.Error("messaging: recreating consumer group failed",
+			"stream", sc.stream, "error", err)
 	}
 }
 

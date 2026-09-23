@@ -11,6 +11,16 @@ dispatch matches on its major component only (PRD §11).
 
 ## [Unreleased]
 
+### Fixed
+
+- A consumer group lost while `Consumer.Run` is running — `FLUSHALL`, a Redis
+  restart without persistence, a failover to a replica without the group,
+  `DEL` of the stream, `XGROUP DESTROY` — is now recreated, at ID `0` as at
+  startup, and consumption resumes. Previously every read and reclaim sweep
+  failed with `NOGROUP` forever: `Run` never returned and nothing was consumed
+  until the process restarted. Recreating at `0` redelivers whatever is still
+  on the stream, so idempotent handlers matter here as everywhere.
+
 ## [0.1.0] - 2026-08-13
 
 First tagged release. The library is feature-complete against

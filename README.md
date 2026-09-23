@@ -135,6 +135,7 @@ The library is **at-least-once**. Three consequences are application obligations
 
 - **Handlers must be idempotent.** The same event may be delivered more than once; `event_id` is the deduplication key.
 - **Ordering is per-stream and only with `Concurrency: 1`** (the default). Reclaimed messages arrive out of order. `Concurrency` bounds in-flight handlers *per subscribed topic*, so a consumer registered on three topics at `Concurrency: 3` can be running nine handlers. Immediate retries run inside the message's slot, so a retrying message holds its topic's slot for the whole retry window — which is what preserves ordering at `Concurrency: 1`.
+- **A lost consumer group is recreated from the start of the stream.** If the group disappears while the consumer runs — `FLUSHALL`, a Redis restart without persistence, a failover to a replica that never had it, `DEL` of the stream, `XGROUP DESTROY` — the consumer logs a WARN (`messaging: consumer group missing, recreating`) and recreates it at ID `0`, just as it does at startup. Whatever is still on the stream is delivered again, including events already handled; the lost group's pending entries cannot be recovered.
 - **Publishing is not transactional with your database.** A crash between a DB write and a publish loses the event. Transactional outbox support is on the roadmap, not in the initial release.
 
 ## Error handling

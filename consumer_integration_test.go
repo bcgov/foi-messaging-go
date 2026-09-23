@@ -1199,3 +1199,110 @@ func TestConsumer_PropagatesTraceContextFromPublisher(t *testing.T) {
 		t.Errorf("producer span trace id = %s, want the caller's root trace %s", got, want)
 	}
 }
+
+// waitForEventNamed waits until handler has received an event whose payload
+// Name is name.
+func waitForEventNamed(t *testing.T, handler *collectingHandler, name, why string) {
+	t.Helper()
+
+	deadline := time.After(20 * time.Second)
+	for {
+		for _, env := range handler.snapshot() {
+			if env.Payload.Name == name {
+				return
+			}
+		}
+		select {
+		case <-handler.notify:
+		case <-time.After(100 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("timed out waiting for %q: %s", name, why)
+		}
+	}
+}
+
+// TestConsumer_RecoversFromLostConsumerGroup: the consumer group used to
+// be created only when Run started. Losing it while running — XGROUP
+// DESTROY, a DEL of the stream, a FLUSHALL, a Redis restart without
+// persistence, a failover to a replica that never had it — left Run
+// blocked forever with every read failing NOGROUP, consuming nothing until
+// the process restarted.
+func TestConsumer_RecoversFromLostConsumerGroup(t *testing.T) {
+	const stream = "foi:documents"
+
+	cases := []struct {
+		name string
+		lose func(ctx context.Context, addr, group string) error
+		// replays says whether the event consumed before the loss must be
+		// delivered again: the group is recreated at "0", so it is
+		// whenever the stream itself survived.
+		replays bool
+	}{
+		{
+			name: "group destroyed",
+			lose: func(ctx context.Context, addr, group string) error {
+				return testsupport.DestroyGroup(ctx, addr, stream, group)
+			},
+			replays: true,
+		},
+		{
+			name: "stream deleted",
+			lose: func(ctx context.Context, addr, _ string) error {
+				return testsupport.DeleteKey(ctx, addr, stream)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := consumeFixture(t)
+			ctx := context.Background()
+
+			publisher, err := messaging.NewPublisher(cfg)
+			if err != nil {
+				t.Fatalf("NewPublisher: %v", err)
+			}
+			t.Cleanup(func() { _ = publisher.Close() })
+
+			consumer, err := messaging.NewConsumer(cfg)
+			if err != nil {
+				t.Fatalf("NewConsumer: %v", err)
+			}
+			handler := newCollectingHandler(0)
+			if err := messaging.RegisterHandler(consumer, documentCreated, handler); err != nil {
+				t.Fatalf("RegisterHandler: %v", err)
+			}
+			runConsumer(t, consumer)
+
+			if _, err := publisher.Publish(ctx, documentCreated,
+				documentCreatedPayload{EntityID: "e1", Name: "before.pdf"}); err != nil {
+				t.Fatalf("Publish before: %v", err)
+			}
+			waitForEventNamed(t, handler, "before.pdf", "the consumer never started")
+			waitForPendingCountZero(t, cfg.Redis.Address, stream, cfg.Consumer.Group)
+
+			if err := tc.lose(ctx, cfg.Redis.Address, cfg.Consumer.Group); err != nil {
+				t.Fatalf("losing the group: %v", err)
+			}
+
+			if _, err := publisher.Publish(ctx, documentCreated,
+				documentCreatedPayload{EntityID: "e2", Name: "after.pdf"}); err != nil {
+				t.Fatalf("Publish after: %v", err)
+			}
+			waitForEventNamed(t, handler, "after.pdf",
+				"a consumer whose group was lost must recreate it and keep consuming")
+			waitForPendingCountZero(t, cfg.Redis.Address, stream, cfg.Consumer.Group)
+
+			var before int
+			for _, env := range handler.snapshot() {
+				if env.Payload.Name == "before.pdf" {
+					before++
+				}
+			}
+			if want := map[bool]int{true: 2, false: 1}[tc.replays]; before != want {
+				t.Errorf("before.pdf delivered %d times, want %d (group recreated at 0, replays=%v)",
+					before, want, tc.replays)
+			}
+		})
+	}
+}

@@ -2,12 +2,31 @@ package redis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 )
+
+// ErrNoGroup reports that the consumer group, or the stream holding it, no
+// longer exists on the server — a FLUSHALL, a restart without persistence, a
+// failover to a replica that never had the group, a DEL of the stream, or an
+// XGROUP DESTROY. It is not transient: retrying the same command can never
+// succeed until the group is created again, so callers test for it with
+// errors.Is and call EnsureGroup rather than backing off.
+var ErrNoGroup = errors.New("consumer group does not exist")
+
+// classifyGroupErr marks a NOGROUP reply with ErrNoGroup, keeping the
+// original error in the chain. Detection is by reply prefix, the same way
+// EnsureGroup recognises BUSYGROUP: go-redis exposes no typed error for it.
+func classifyGroupErr(err error) error {
+	if strings.HasPrefix(err.Error(), "NOGROUP") {
+		return fmt.Errorf("%w: %w", ErrNoGroup, err)
+	}
+	return err
+}
 
 // Entry is a single Redis Streams entry, reduced to plain types so no
 // go-redis value escapes this package.
@@ -68,7 +87,7 @@ func (r *StreamReader) ReadNew(ctx context.Context, stream string, count int64, 
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("reading group %q on stream %q: %w", r.group, stream, err)
+		return nil, fmt.Errorf("reading group %q on stream %q: %w", r.group, stream, classifyGroupErr(err))
 	}
 
 	var entries []Entry
@@ -96,7 +115,7 @@ func (r *StreamReader) PendingOverIdle(ctx context.Context, stream string, minId
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("listing pending entries on stream %q: %w", stream, err)
+		return nil, fmt.Errorf("listing pending entries on stream %q: %w", stream, classifyGroupErr(err))
 	}
 
 	entries := make([]PendingEntry, 0, len(pending))
@@ -132,7 +151,7 @@ func (r *StreamReader) Claim(ctx context.Context, stream string, minIdle time.Du
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("claiming entries on stream %q: %w", stream, err)
+		return nil, fmt.Errorf("claiming entries on stream %q: %w", stream, classifyGroupErr(err))
 	}
 
 	entries := make([]Entry, 0, len(messages))
