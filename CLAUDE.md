@@ -158,6 +158,11 @@ one fixes — read the comment before "simplifying" any of them:
 - Per-message contexts are `context.WithoutCancel(ctx)`-derived so handlers keep a live
   context through the whole drain; the ack path uses its own detached, timeout-bounded ctx.
 - `Run` joins every teardown error rather than returning the first.
+- A `NOGROUP` reply (`internal/redis.ErrNoGroup`) is not a transient read error: the
+  read and claim loops call `recreateGroup`, which re-runs `EnsureGroup` at ID `0`.
+  `EnsureGroup` used to run only in `Subscribe`, so a group lost mid-run left both
+  loops retrying forever. `0` rather than `$` is deliberate — duplicates over silent
+  loss.
 
 ### Transport metadata vs envelope
 
